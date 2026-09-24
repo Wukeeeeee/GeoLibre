@@ -1474,6 +1474,18 @@ def test_voronoi_antimeridian_crossing_raises_value_error() -> None:
 
 
 @requires_geopandas
+def test_voronoi_out_of_range_points_raise_value_error() -> None:
+    # Points past the WGS84 limits would clamp the envelope to a sliver that no
+    # longer contains them; reject them instead of emitting stray cells.
+    with pytest.raises(ValueError, match="valid WGS84 coordinates"):
+        run_vector_tool(
+            "voronoi",
+            _points((181.0, 10.0), (182.0, 11.0), (183.0, 10.0)),
+            parameters={"type": "voronoi"},
+        )
+
+
+@requires_geopandas
 def test_voronoi_envelope_clamped_to_wgs84_bounds() -> None:
     # High-latitude and boundary points must not produce cells with coordinates
     # outside valid WGS84 geographic limits (lat in [-90, 90], lon in [-180, 180]).

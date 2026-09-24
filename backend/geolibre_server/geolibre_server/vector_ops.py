@@ -1100,6 +1100,13 @@ def _voronoi(
     # Clip the (otherwise unbounded outer) cells to the points' bbox expanded by a
     # 10% margin, matching the client, clamped to WGS84 bounds so coordinates
     # stay within valid geographic domain. Guard against antimeridian crossings.
+    # Out-of-range points would clamp the envelope to a sliver that no longer
+    # contains them, so reject those up front.
+    if minx < -180.0 or maxx > 180.0 or miny < -90.0 or maxy > 90.0:
+        raise ValueError(
+            "Input points must use valid WGS84 coordinates "
+            "(longitude in [-180, 180], latitude in [-90, 90])"
+        )
     dx = maxx - minx
     if dx > 180.0:
         raise ValueError(
