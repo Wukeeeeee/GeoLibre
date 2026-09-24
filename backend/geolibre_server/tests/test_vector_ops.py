@@ -1690,12 +1690,8 @@ def test_simplify_unparseable_tolerance_raises_value_error() -> None:
         (0.05, "tolerance 0.05 degrees"),
     ],
 )
-def test_simplify_preserves_boundary_tolerances(
-    tolerance: object, expected_tolerance: str
-) -> None:
-    geojson, messages = run_vector_tool(
-        "simplify", SQUARE, parameters={"tolerance": tolerance}
-    )
+def test_simplify_preserves_boundary_tolerances(tolerance: object, expected_tolerance: str) -> None:
+    geojson, messages = run_vector_tool("simplify", SQUARE, parameters={"tolerance": tolerance})
     assert len(geojson["features"]) == 1
     assert any(expected_tolerance in m for m in messages)
 
