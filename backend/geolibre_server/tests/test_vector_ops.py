@@ -1462,6 +1462,36 @@ def test_voronoi_diagonal_collinear_points_raise() -> None:
 
 
 @requires_geopandas
+def test_voronoi_antimeridian_crossing_raises_value_error() -> None:
+    # A layer spanning > 180° of longitude crosses the antimeridian; reject
+    # rather than building an unconstrained cross-world planar envelope.
+    with pytest.raises(ValueError, match="cross the antimeridian"):
+        run_vector_tool(
+            "voronoi",
+            _points((179.0, 10.0), (-179.0, 11.0), (179.5, 12.0)),
+            parameters={"type": "voronoi"},
+        )
+
+
+@requires_geopandas
+def test_voronoi_envelope_clamped_to_wgs84_bounds() -> None:
+    # High-latitude and boundary points must not produce cells with coordinates
+    # outside valid WGS84 geographic limits (lat in [-90, 90], lon in [-180, 180]).
+    arctic_points = _points((0.0, 70.0), (10.0, 80.0), (5.0, 89.0))
+    geojson, _ = run_vector_tool("voronoi", arctic_points, parameters={"type": "voronoi"})
+    assert len(geojson["features"]) > 0
+    from shapely.geometry import shape
+
+    for feature in geojson["features"]:
+        geom = shape(feature["geometry"])
+        minx, miny, maxx, maxy = geom.bounds
+        assert -180.0 <= minx <= 180.0
+        assert -180.0 <= maxx <= 180.0
+        assert -90.0 <= miny <= 90.0
+        assert -90.0 <= maxy <= 90.0
+
+
+@requires_geopandas
 def test_json_wrapper_round_trips() -> None:
     payload = json.dumps(
         {

@@ -1098,10 +1098,22 @@ def _voronoi(
         message = f"Delaunay: produced {len(triangles)} triangle(s) from {len(points)} point(s)"
         return _to_feature_collection(result), [message]
     # Clip the (otherwise unbounded outer) cells to the points' bbox expanded by a
-    # 10% margin, matching the client, so they get a finite extent.
+    # 10% margin, matching the client, clamped to WGS84 bounds so coordinates
+    # stay within valid geographic domain. Guard against antimeridian crossings.
     dx = maxx - minx
+    if dx > 180.0:
+        raise ValueError(
+            f"Input points cross the antimeridian (longitude span > 180°, "
+            f"got {dx:.1f}°). Split the layer at the dateline into "
+            "per-hemisphere layers, or reproject to a local projected CRS, "
+            "before running Voronoi."
+        )
     dy = maxy - miny
-    envelope = box(minx - dx * 0.1, miny - dy * 0.1, maxx + dx * 0.1, maxy + dy * 0.1)
+    env_minx = max(-180.0, minx - dx * 0.1)
+    env_maxx = min(180.0, maxx + dx * 0.1)
+    env_miny = max(-90.0, miny - dy * 0.1)
+    env_maxy = min(90.0, maxy + dy * 0.1)
+    envelope = box(env_minx, env_miny, env_maxx, env_maxy)
     diagram = voronoi_diagram(multipoint, envelope=envelope)
     cells = [cell.intersection(envelope) for cell in diagram.geoms]
     # Clipping a cell whose edge coincides with the envelope can yield a
