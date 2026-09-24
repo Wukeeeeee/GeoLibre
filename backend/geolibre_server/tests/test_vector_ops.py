@@ -1663,7 +1663,9 @@ def test_check_validity_counts_empty_geometry_as_missing() -> None:
 
 
 @requires_geopandas
-@pytest.mark.parametrize("tolerance", [-1, -0.001, float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "tolerance", [-1, -0.001, True, False, float("nan"), float("inf"), float("-inf")]
+)
 def test_simplify_negative_or_non_finite_tolerance_raises_value_error(tolerance: object) -> None:
     with pytest.raises(
         ValueError, match="Simplify tolerance must be a finite, non-negative number"
@@ -1680,10 +1682,22 @@ def test_simplify_unparseable_tolerance_raises_value_error() -> None:
 
 
 @requires_geopandas
-def test_simplify_runs_cleanly_on_valid_tolerance() -> None:
-    geojson, messages = run_vector_tool("simplify", SQUARE, parameters={"tolerance": 0.05})
+@pytest.mark.parametrize(
+    ("tolerance", "expected_tolerance"),
+    [
+        (0, "tolerance 0.0 degrees"),
+        (None, "tolerance 0.01 degrees"),
+        (0.05, "tolerance 0.05 degrees"),
+    ],
+)
+def test_simplify_preserves_boundary_tolerances(
+    tolerance: object, expected_tolerance: str
+) -> None:
+    geojson, messages = run_vector_tool(
+        "simplify", SQUARE, parameters={"tolerance": tolerance}
+    )
     assert len(geojson["features"]) == 1
-    assert any("Simplified 1 feature(s)" in m for m in messages)
+    assert any(expected_tolerance in m for m in messages)
 
 
 NULL_GEOM_LAYER = {
@@ -1710,6 +1724,13 @@ def test_bounding_box_computes_expected_bounds() -> None:
     assert len(geojson["features"]) == 1
     coords = geojson["features"][0]["geometry"]["coordinates"][0]
     assert len(coords) == 5
+    assert coords == [
+        [1.0, 0.0],
+        [1.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 0.0],
+        [1.0, 0.0],
+    ]
     assert any("Computed bounding box" in m for m in messages)
 
 

@@ -103,6 +103,12 @@ def _to_feature_collection(gdf: Any) -> dict:
     return json.loads(gdf.to_json())
 
 
+def _require_finite_bounds(bounds: Any, message: str) -> None:
+    """Raise ValueError when total_bounds coordinates contain NaN/Infinity."""
+    if not all(math.isfinite(v) for v in bounds):
+        raise ValueError(message)
+
+
 def _estimate_metric_crs(gdf: Any) -> Any:
     """Estimate a local metric (UTM) CRS, guarding against antimeridian crossings.
 
@@ -118,11 +124,10 @@ def _estimate_metric_crs(gdf: Any) -> Any:
     genuinely spanning over 180° of longitude without touching the dateline is
     rejected as well.
     """
-    minx, miny, maxx, maxy = gdf.total_bounds
-    if not (
-        math.isfinite(minx) and math.isfinite(miny) and math.isfinite(maxx) and math.isfinite(maxy)
-    ):
-        raise ValueError("Input layer contains no valid geometry coordinates to project")
+    _require_finite_bounds(
+        gdf.total_bounds, "Input layer contains no valid geometry coordinates to project"
+    )
+    minx, _, maxx, _ = gdf.total_bounds
     span = maxx - minx
     if span > 180.0:
         raise ValueError(
@@ -342,11 +347,10 @@ def _bounding_box(
     from shapely.geometry import box  # noqa: PLC0415
 
     gdf = _load_gdf(geojson, "Input layer")
+    _require_finite_bounds(
+        gdf.total_bounds, "Input layer contains no valid geometry to compute a bounding box"
+    )
     minx, miny, maxx, maxy = gdf.total_bounds
-    if not (
-        math.isfinite(minx) and math.isfinite(miny) and math.isfinite(maxx) and math.isfinite(maxy)
-    ):
-        raise ValueError("Input layer contains no valid geometry to compute a bounding box")
     result = gpd.GeoDataFrame(geometry=[box(minx, miny, maxx, maxy)], crs=WGS84)
     return _to_feature_collection(result), ["Computed bounding box"]
 
@@ -362,6 +366,8 @@ def _simplify(
     raw_tolerance = parameters.get("tolerance", 0.01)
     if raw_tolerance is None:
         raw_tolerance = 0.01
+    if isinstance(raw_tolerance, bool):
+        raise ValueError("Simplify tolerance must be a finite, non-negative number")
     try:
         tolerance = float(raw_tolerance)
     except (TypeError, ValueError, OverflowError) as exc:
