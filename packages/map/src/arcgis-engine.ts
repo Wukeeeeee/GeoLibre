@@ -61,6 +61,7 @@ import {
   type ArcgisSymbolJson,
 } from "./arcgis-layers";
 import { renderMarkerCanvas } from "./markers";
+import { featurePickIndex } from "./feature-pick-index";
 import { parseLabelOverride } from "./label-style";
 import { planArcgisBasemap, type ArcgisBasemapPlan, sameArcgisBasemapPlan } from "./arcgis-basemap";
 import {
@@ -1986,17 +1987,21 @@ export class ArcgisEngine implements MapEngine {
     for (const layer of this.layers) {
       if (layerId && layer.id !== layerId) continue;
       if (!layer.visible || !layer.geojson || !this.natives.has(layer.id)) continue;
-      layer.geojson.features.forEach((feature, index) => {
+      // The pick runs per pointer frame for hover tips, so only the features
+      // whose bounds are near the point get the exact geometry test (#2629).
+      const collection = layer.geojson;
+      for (const index of featurePickIndex(collection).candidates(lngLat, tolerance)) {
+        const feature = collection.features[index];
         if (!feature.geometry || !geometryContainsPoint(feature.geometry, lngLat, tolerance))
-          return;
-        if (!featurePassesFilters(layer, feature, zoom)) return;
+          continue;
+        if (!featurePassesFilters(layer, feature, zoom)) continue;
         features.push({
           layerId: layer.id,
           featureId: String(feature.id ?? index),
           properties: feature.properties ?? {},
           geometry: feature.geometry,
         });
-      });
+      }
     }
     return features;
   }
@@ -2468,6 +2473,47 @@ export class ArcgisEngine implements MapEngine {
       handle.remove();
       this.handles.delete(handle);
     };
+  }
+  /**
+   * Unlike ArcgisCanvas's module-level `whenDrawn`, which waits for the
+   * basemap only (for the loading indicator), this waits for the whole view,
+   * data layers included, as a capture needs.
+   */
+  whenDrawn(timeoutMs: number): Promise<void> {
+    const view = this.view;
+    if (!view) return Promise.resolve();
+    return new Promise((resolve) => {
+      let finished = false;
+      let handle: ArcgisHandle | undefined;
+      let frame = 0;
+      const done = () => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        cancelAnimationFrame(frame);
+        if (handle) {
+          handle.remove();
+          this.handles.delete(handle);
+        }
+        resolve();
+      };
+      const timer = setTimeout(done, timeoutMs);
+      // Two frames first, as the canvas's own whenDrawn waits: right after a
+      // jump the layer views have not scheduled the new extent's tiles, and
+      // `updating` still reads false.
+      frame = requestAnimationFrame(
+        () =>
+          (frame = requestAnimationFrame(() => {
+            if (finished || this.view !== view) return done();
+            handle = this.sdk.reactiveUtils.when(() => view.stationary && !view.updating, done, {
+              initial: true,
+            });
+            // Torn down with the view, like the class's other subscriptions.
+            if (finished) handle.remove();
+            else this.handles.add(handle);
+          })),
+      );
+    });
   }
   onCameraIdle(listener: (event?: CameraIdleEvent) => void): () => void {
     const view = this.view;

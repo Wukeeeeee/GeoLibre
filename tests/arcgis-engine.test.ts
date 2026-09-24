@@ -699,6 +699,49 @@ describe("ArcgisEngine camera conventions", () => {
     await engine.settleView({ center: [5, 5], zoom: 7, bearing: 0, pitch: 0 });
     assert.deepEqual((goTo[0] as { target: { center: [number, number] } }).target.center, [5, 5]);
   });
+  it("resolves whenDrawn on a settled draw, on its timeout, or when the view goes", async () => {
+    const shim = !globalThis.requestAnimationFrame;
+    if (shim)
+      Object.assign(globalThis, {
+        requestAnimationFrame: (cb: () => void) => setTimeout(cb, 0),
+        cancelAnimationFrame: (id: number) => clearTimeout(id),
+      });
+    const frames = () => new Promise((resolve) => setTimeout(resolve, 5));
+    // Timers run late on a loaded runner: poll rather than assume a delay.
+    const until = async (check: () => boolean, poke = () => {}) => {
+      for (let i = 0; i < 200 && !check(); i++) {
+        poke();
+        await frames();
+      }
+      return check();
+    };
+    try {
+      const { engine, fireWatchers } = makeEngine();
+      // The view reports drawn (two frames later the watcher is registered).
+      let drawn = false;
+      void engine.whenDrawn(60_000).then(() => (drawn = true));
+      assert.equal(
+        await until(
+          () => drawn,
+          () => fireWatchers(),
+        ),
+        true,
+      );
+      // Nothing reports: the timeout is the ceiling.
+      const started = Date.now();
+      await engine.whenDrawn(30);
+      assert.ok(Date.now() - started >= 25);
+      // The view is destroyed before the frames run: resolve, don't wait.
+      let gone = false;
+      void engine.whenDrawn(60_000).then(() => (gone = true));
+      engine.destroy();
+      assert.equal(await until(() => gone), true);
+    } finally {
+      if (shim)
+        for (const key of ["requestAnimationFrame", "cancelAnimationFrame"])
+          delete (globalThis as Record<string, unknown>)[key];
+    }
+  });
   it("converts GeoJSON geometry to SDK geometry JSON", () => {
     assert.deepEqual(geojsonToArcgisGeometry({ type: "Point", coordinates: [1, 2] }), {
       type: "point",
