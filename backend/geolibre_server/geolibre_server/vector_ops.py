@@ -120,10 +120,7 @@ def _estimate_metric_crs(gdf: Any) -> Any:
     """
     minx, miny, maxx, maxy = gdf.total_bounds
     if not (
-        math.isfinite(minx)
-        and math.isfinite(miny)
-        and math.isfinite(maxx)
-        and math.isfinite(maxy)
+        math.isfinite(minx) and math.isfinite(miny) and math.isfinite(maxx) and math.isfinite(maxy)
     ):
         raise ValueError("Input layer contains no valid geometry coordinates to project")
     span = maxx - minx
@@ -347,10 +344,7 @@ def _bounding_box(
     gdf = _load_gdf(geojson, "Input layer")
     minx, miny, maxx, maxy = gdf.total_bounds
     if not (
-        math.isfinite(minx)
-        and math.isfinite(miny)
-        and math.isfinite(maxx)
-        and math.isfinite(maxy)
+        math.isfinite(minx) and math.isfinite(miny) and math.isfinite(maxx) and math.isfinite(maxy)
     ):
         raise ValueError("Input layer contains no valid geometry to compute a bounding box")
     result = gpd.GeoDataFrame(geometry=[box(minx, miny, maxx, maxy)], crs=WGS84)

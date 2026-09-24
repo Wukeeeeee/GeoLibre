@@ -1665,13 +1665,17 @@ def test_check_validity_counts_empty_geometry_as_missing() -> None:
 @requires_geopandas
 @pytest.mark.parametrize("tolerance", [-1, -0.001, float("nan"), float("inf"), float("-inf")])
 def test_simplify_negative_or_non_finite_tolerance_raises_value_error(tolerance: object) -> None:
-    with pytest.raises(ValueError, match="Simplify tolerance must be a finite, non-negative number"):
+    with pytest.raises(
+        ValueError, match="Simplify tolerance must be a finite, non-negative number"
+    ):
         run_vector_tool("simplify", SQUARE, parameters={"tolerance": tolerance})
 
 
 @requires_geopandas
 def test_simplify_unparseable_tolerance_raises_value_error() -> None:
-    with pytest.raises(ValueError, match="Simplify tolerance must be a finite, non-negative number"):
+    with pytest.raises(
+        ValueError, match="Simplify tolerance must be a finite, non-negative number"
+    ):
         run_vector_tool("simplify", SQUARE, parameters={"tolerance": "invalid_num"})
 
 
@@ -1719,4 +1723,3 @@ def test_buffer_empty_geometries_raises_value_error() -> None:
 def test_centroids_empty_geometries_raises_value_error() -> None:
     with pytest.raises(ValueError, match="contains no valid geometry coordinates to project"):
         run_vector_tool("centroids", NULL_GEOM_LAYER)
-
