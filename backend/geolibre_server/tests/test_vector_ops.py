@@ -1486,6 +1486,17 @@ def test_voronoi_out_of_range_points_raise_value_error() -> None:
 
 
 @requires_geopandas
+def test_voronoi_non_finite_points_raise_value_error() -> None:
+    # NaN passes every bounds comparison, so it needs its own guard.
+    with pytest.raises(ValueError, match="finite coordinates"):
+        run_vector_tool(
+            "voronoi",
+            _points((float("nan"), 10.0), (1.0, 11.0), (2.0, 10.0)),
+            parameters={"type": "voronoi"},
+        )
+
+
+@requires_geopandas
 def test_voronoi_envelope_clamped_to_wgs84_bounds() -> None:
     # High-latitude and boundary points must not produce cells with coordinates
     # outside valid WGS84 geographic limits (lat in [-90, 90], lon in [-180, 180]).

@@ -1076,6 +1076,9 @@ def _voronoi(
             points.extend(list(geom.geoms))
     if len(points) < 3:
         raise ValueError("Voronoi / Delaunay needs at least 3 points")
+    # NaN slips past every bounds comparison below, so reject it explicitly.
+    if any(not (math.isfinite(point.x) and math.isfinite(point.y)) for point in points):
+        raise ValueError("Input points must have finite coordinates")
     multipoint = MultiPoint(points)
     # Both diagrams are undefined for collinear/coincident points (a zero-area
     # bounding box); bail with a clear message rather than a degenerate result.
