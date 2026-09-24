@@ -1682,6 +1682,13 @@ def test_simplify_unparseable_tolerance_raises_value_error() -> None:
 
 
 @requires_geopandas
+def test_simplify_defaults_missing_tolerance() -> None:
+    geojson, messages = run_vector_tool("simplify", SQUARE)
+    assert len(geojson["features"]) == 1
+    assert any("tolerance 0.01 degrees" in m for m in messages)
+
+
+@requires_geopandas
 @pytest.mark.parametrize(
     ("tolerance", "expected_tolerance"),
     [
