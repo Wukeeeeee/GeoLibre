@@ -23,19 +23,33 @@ Configuration:
 - `GEOLIBRE_VIEWER_URL`: GeoLibre viewer origin.
 - `GEOLIBRE_CORS_ORIGINS`: comma-separated web origins, default `*` for
   ordinary API routes. OAuth CORS always includes registered web callback
-  origins, but never inherits `*`. To permit browser requests from
-  `tauri://localhost`, `http://tauri.localhost`, `http://localhost:5173`, or
-  `http://127.0.0.1:5173`, list each needed origin explicitly here. Native
-  desktop requests that do not use browser fetch/XHR do not require CORS.
+  origins, but never inherits `*`. Register the exact browser app origin;
+  self-hosted desktop calls use browser CORS, so allow `tauri://localhost`
+  and/or `http://tauri.localhost` there as well. The shipped
+  `https://share.geolibre.app` desktop origin uses native HTTP for
+  authenticated requests instead; other hosts do not silently bypass CORS.
 - `GEOLIBRE_OAUTH_CLIENTS`: JSON array of exact public-client registrations:
-  `[{"client_id":"geolibre-web","name":"GeoLibre Web","redirect_uris":["https://app.example/oauth-callback.html"],"scopes":["read:projects","write:projects","share:public"]}]`.
-  Empty or unset disables OAuth without validating OAuth-only settings. The
-  supported IDs are `geolibre-web` and `geolibre-desktop`; the desktop redirect
-  must be exactly `org.geolibre.desktop:/oauth/callback`.
+  ```json
+  [
+    {"client_id":"geolibre-web","name":"GeoLibre Web",
+     "redirect_uris":["https://app.example/oauth-callback.html"],
+     "scopes":["read:projects","write:projects","share:public","manage:sessions"]},
+    {"client_id":"geolibre-desktop","name":"GeoLibre Desktop",
+     "redirect_uris":["org.geolibre.desktop:/oauth/callback"],
+     "scopes":["read:projects","write:projects","share:public","manage:sessions"]}
+  ]
+  ```
+  Empty or unset disables OAuth without validating OAuth-only settings. Both
+  clients must use their own exact redirect; the desktop callback works only
+  after the URI handler is registered by an installed app. The three project
+  scopes form a refreshable project grant; `manage:sessions` must be requested
+  alone for a fresh, access-only, five-minute consent. Personal API tokens
+  cannot carry that scope.
 - `GEOLIBRE_OAUTH_CODE_TTL_SECONDS` (default `60`),
   `GEOLIBRE_OAUTH_ACCESS_TTL_SECONDS` (`600`), and
   `GEOLIBRE_OAUTH_REFRESH_TTL_SECONDS` (`2592000`): positive integer grant
-  lifetimes. Refresh rotation never extends the family's absolute expiry.
+  lifetimes. Refresh rotation never extends a project family's absolute expiry;
+  the management grant always expires within 300 seconds and never refreshes.
 - `GEOLIBRE_MAX_PROJECT_BYTES`, `GEOLIBRE_MAX_THUMBNAIL_BYTES`: upload limits.
 - `GEOLIBRE_HOST`, `GEOLIBRE_PORT`: bind address and port for the
   `geolibre-server-api` entry point, default `0.0.0.0` and `8000`. Bind to

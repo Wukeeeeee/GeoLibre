@@ -183,6 +183,9 @@ function isGeoJsonValue(value: object): boolean {
  *   `""` at the root — the argument `JSON.stringify` passes to `toJSON`.
  * @param ancestors Containers currently open on the recursion stack, used to
  *   detect cycles.
+ * @param presets Objects whose serialized text is already known at the depth
+ *   they sit at, written verbatim instead of being walked again. Used by
+ *   {@link serializeProjectWithLayerCache} to splice in cached layers.
  * @returns The serialized text, or undefined for values `JSON.stringify` also
  *   drops (undefined, functions, symbols).
  */
@@ -191,7 +194,12 @@ function serializeProjectValue(
   depth: number,
   key: string,
   ancestors: Set<object>,
+  presets?: ReadonlyMap<object, string>,
 ): string | undefined {
+  if (presets !== undefined && value !== null && typeof value === "object") {
+    const preset = presets.get(value);
+    if (preset !== undefined) return preset;
+  }
   if (value !== null && typeof value === "object") {
     // Honor the toJSON hook the way JSON.stringify does, so a value that
     // replaces itself is inspected in its replaced form. It receives the same
@@ -227,13 +235,14 @@ function serializeProjectValue(
       const entries = Array.from(
         { length: value.length },
         (_unused, index) =>
-          serializeProjectValue(value[index], depth + 1, String(index), ancestors) ?? "null",
+          serializeProjectValue(value[index], depth + 1, String(index), ancestors, presets) ??
+          "null",
       );
       return `[\n${pad}${entries.join(`,\n${pad}`)}\n${closePad}]`;
     }
     const entries: string[] = [];
     for (const [entryKey, entry] of Object.entries(value)) {
-      const serialized = serializeProjectValue(entry, depth + 1, entryKey, ancestors);
+      const serialized = serializeProjectValue(entry, depth + 1, entryKey, ancestors, presets);
       // An unserializable object value is omitted, matching JSON.stringify.
       if (serialized === undefined) continue;
       entries.push(`${JSON.stringify(entryKey)}: ${serialized}`);
@@ -256,12 +265,75 @@ function serializeProjectValue(
 export function serializeProject(project: GeoLibreProject): string {
   return (
     serializeProjectValue(
-      { ...project, layers: project.layers.map(withoutLocalRasterBytes) },
+      { ...project, layers: project.layers.map(portableLayer) },
       0,
       "",
       new Set(),
     ) ?? "null"
   );
+}
+
+/**
+ * Per-layer serialized text kept across {@link serializeProjectWithLayerCache}
+ * calls, keyed by the layer record each entry was built from. A `WeakMap`, so a
+ * layer the store has replaced or removed drops its text with it.
+ */
+export type ProjectLayerSerializationCache = WeakMap<object, { index: number; text: string }>;
+
+/** Create an empty {@link ProjectLayerSerializationCache}. */
+export function createProjectLayerSerializationCache(): ProjectLayerSerializationCache {
+  return new WeakMap();
+}
+
+/**
+ * Serialize a project exactly as {@link serializeProject} does, reusing the
+ * text of every layer whose source record is unchanged since an earlier call.
+ *
+ * Feature data lives inside layer records, so re-stringifying every layer on
+ * each autosave costs megabytes of main-thread work for a project with large
+ * GeoJSON layers — even when only the camera moved (GeoLibre#2633). The store
+ * replaces a layer object whenever it changes, so object identity is a sound
+ * cache key: a camera move reuses every layer, and an edit to one layer
+ * re-serializes only that one.
+ *
+ * `layerSources[i]` must be the record `project.layers[i]` was derived from
+ * (e.g. the store's `layers`, before `projectFromStore` prepared them), and that
+ * derivation must depend on the record alone — as `buildProjectSnapshot`'s does
+ * — or a cached entry could outlive a change it should have reflected. When the
+ * two arrays differ in length the cache is bypassed rather than trusted.
+ *
+ * @param project Project to serialize, as built from `layerSources`.
+ * @param layerSources Immutable source record for each entry of
+ *   `project.layers`, in the same order, used as the cache key.
+ * @param cache Cache shared between calls; see
+ *   {@link createProjectLayerSerializationCache}.
+ * @returns The same text {@link serializeProject} returns for `project`.
+ */
+export function serializeProjectWithLayerCache(
+  project: GeoLibreProject,
+  layerSources: readonly object[],
+  cache: ProjectLayerSerializationCache,
+): string {
+  if (layerSources.length !== project.layers.length) return serializeProject(project);
+  const layers = project.layers.map(portableLayer);
+  // Presets are keyed by layer object, so a record listed twice would get one
+  // index's text in both places. The store never does that; bypass if it does.
+  if (new Set(layers).size !== layers.length) return serializeProject(project);
+  const presets = new Map<object, string>();
+  layers.forEach((layer, index) => {
+    const source = layerSources[index];
+    const cached = cache.get(source);
+    // The layer is serialized under its array index as the key (a `toJSON`
+    // hook would see it), so text is reused only at the index it was built for.
+    let text = cached?.index === index ? cached.text : undefined;
+    if (text === undefined) {
+      // Depth 2: the root object is depth 0 and its `layers` array depth 1.
+      text = serializeProjectValue(layer, 2, String(index), new Set()) ?? "null";
+      cache.set(source, { index, text });
+    }
+    presets.set(layer, text);
+  });
+  return serializeProjectValue({ ...project, layers }, 0, "", new Set(), presets) ?? "null";
 }
 
 export function parseProject(json: string): GeoLibreProject {
@@ -1471,6 +1543,35 @@ function withoutLocalRasterBytes(layer: GeoLibreLayer): GeoLibreLayer {
   return { ...layer, metadata };
 }
 
+/**
+ * Drop a Zarr layer's request headers. They authenticate the store (a bearer
+ * token, an API key), so they are credentials: the Zarr adds keep them in a
+ * session-only map the renderer reads (`registerZarrHeaders` in
+ * @geolibre/map), but a project saved before that change carries them on
+ * `source` (opengeos/GeoLibre#2643). Not applied on parse, so such a project
+ * still authenticates for the session it is opened in.
+ *
+ * @param layer - Any layer.
+ * @returns The layer without `source.headers` when it is a Zarr layer, else
+ *   the same object.
+ */
+function withoutZarrHeaders(layer: GeoLibreLayer): GeoLibreLayer {
+  if (layer.type !== "zarr" || layer.source?.headers === undefined) return layer;
+  const { headers: _headers, ...source } = layer.source;
+  return { ...layer, source };
+}
+
+/**
+ * Strip the session-only state every serializer must leave out, whether or not
+ * the project came through `projectFromStore`.
+ *
+ * @param layer - Any layer.
+ * @returns The layer as it may be written to a project file.
+ */
+function portableLayer(layer: GeoLibreLayer): GeoLibreLayer {
+  return withoutZarrHeaders(withoutLocalRasterBytes(layer));
+}
+
 function normalizeLayer(layer: GeoLibreLayer): GeoLibreLayer {
   layer = withoutLocalRasterBytes(layer);
   // `capabilities` is split off the spread rather than overwritten: a raw value
@@ -1718,7 +1819,7 @@ function hasRestorableSourceUrl(layer: GeoLibreLayer): boolean {
 }
 
 function prepareLayerForSave(layer: GeoLibreLayer): GeoLibreLayer {
-  layer = withoutLocalRasterBytes(layer);
+  layer = portableLayer(layer);
   // This flag describes unsaved changes to the live source, not persisted
   // project state. A reference-only save reloads the original geometries;
   // carrying the flag into that project would warn about nonexistent edits.

@@ -15,6 +15,16 @@ error** — the feature just stops working. After bumping any of the packages
 below (**including Dependabot PRs**), do the listed check and run the frontend
 suite.
 
+### Patched packages (`patches/`)
+
+`postinstall` applies the `patch-package` patches in `patches/`, and each patch
+file names the exact version it was made against. `@carbonplan/zarr-layer` is
+declared with an exact version (no `^`) in both `apps/geolibre-desktop` and
+`packages/plugins` so a routine install can never move it past the patched
+version. To bump it, regenerate the patch against the new version (or drop it if
+upstream fixed the bug), rename the patch file, and update both declarations and
+`package-lock.json` in the same PR.
+
 ### `geolibre-wasm` (`packages/processing/package.json`)
 
 - **Processing menu catalog.** `ProcessingMenu.tsx` renders from a checked-in,
@@ -173,7 +183,7 @@ black — it declines the stack.
 - **The PMTiles control's layer ids** (`pmtilesControlLayerId` /
   `pmtilesIdsForSourceLayers` / `pmtilesIdNamesSourceLayer`,
   `packages/map/src/pmtiles-layer.ts`, read from `layer-sync.ts` and
-  `packages/plugins/src/plugins/maplibre-components.ts`) mirror an unexported fact
+  `packages/plugins/src/plugins/components/pmtiles.ts`) mirror an unexported fact
   about `PMTilesLayerControl`: it names its MapLibre layers
   `${sourceId}-${name}-${kind}` from the **raw** source-layer name, where
   `pmtilesVectorLayerId` percent-encodes it. The two agree for every name needing
@@ -273,10 +283,12 @@ field, since neither library exposes a public reader. Losing either costs only
 the mirror — the measured line goes back to being hidden inside the cloud, which
 is what #2533 was.
 
-The **class** is imported from the package rather than copied, so a rename
-fails `npm run typecheck`. Keep it that way: the package is side-effect-free, so
-the import tree-shakes to the string and does not pull deck.gl into this
-eagerly loaded plugin. The **placement** is not visible to the compiler, so
+The **class** is a hand-kept copy of the package's `DECK_CANVAS_CLASS`, not an
+import: `maplibre-gl-lidar` builds into its own lazy chunk, and importing even
+this one string would pull that chunk onto the startup path.
+`tests/effects-settings.test.ts` builds its expected selector from the package
+export, so a rename upstream fails `npm run test:frontend`. The **placement**
+is not visible to the compiler, so
 `e2e/lidar-canvas-stacking.spec.ts` mounts the real control and asserts the
 resulting DOM order and z-indices — run it on a bump
 (`npx playwright test e2e/lidar-canvas-stacking.spec.ts --project=features`).
@@ -291,6 +303,29 @@ it. `addLidarLayerFromUrl` also relies on `load` firing, and adding the store
 layer, before `loadPointCloud` resolves; it throws if not.
 `tests/lidar-url-layer.test.ts` pins the GeoLibre side of both. Re-read
 `loadPointCloud` on a bump.
+
+### `maplibre-gl-splat` (`packages/plugins/package.json`) — private internals
+
+`packages/plugins/src/plugins/components/splatting.ts` reaches into
+`GaussianSplatControl`'s private fields, which the compiler cannot check:
+
+- `reserveSplattingIds` replaces the `_layerCounter` / `_modelCounter` instance
+  fields with accessors. Upstream names each asset `splat-${this._layerCounter++}`
+  / `model-${this._modelCounter++}`, and a new control restarts at 0, so without
+  the accessors a fresh load could take a saved layer's id and overwrite it.
+  Restoring a saved layer under its own id also goes through them.
+- `recordSplattingPlacements` wraps `loadSplat` / `loadModel` on the instance and
+  reads `_splatLayers` / `_modelLayers` (per-asset longitude/latitude/altitude),
+  `_state.rotation` / `_state.scale` and `_options.defaultModelRotation`, so the
+  store layer carries the placement a restore needs. The restore turns
+  `_options.flyTo` off while it runs.
+
+If upstream renames those fields or changes how it assigns ids, id reservation
+and placement restore stop working without an error.
+`tests/splatting-restore.test.ts` drives a fake with the same shape, so it will
+not catch that either: re-read `loadSplat` / `loadModel` in the package on a bump.
+Better still, upstream an id option and a per-asset placement getter and delete
+the patching.
 
 ### `maplibre-gl-raster` — stretch and gamma curves
 
@@ -331,6 +366,20 @@ above this one is checked by the **compiler**:
 assignability against the real imported type, so a renamed or dropped engine
 identifier fails `npm run typecheck`. Nothing extra to do on a bump beyond letting
 the build run.
+
+### `maplibre-gl-raster` — picker data copied to keep it off startup
+
+`apps/geolibre-desktop/src/lib/raster-picker-mirror.ts` is a hand-kept copy of
+the package's `COLORMAP_OPTIONS`, `NORMALIZED_DIFFERENCE_INDICES`,
+`CUSTOM_NORMALIZED_DIFFERENCE`, `indexById` and `guessBandForRole`. The Style
+panel's colormap and spectral index pickers need them as soon as they render,
+and the package ships as one shared chunk, so importing even one constant put
+the whole ~0.35 MB library on the startup path. Everything else GeoLibre takes
+from the package is async and dynamic-imports it instead; keep new value
+imports that way.
+`tests/raster-picker-mirror.test.ts` compares every value and both helpers with
+the package export, so a colormap added or renamed upstream fails
+`npm run test:frontend`. Regenerate the copy from the package when it does.
 
 ### `tauri-plugin-persisted-scope` — private on-disk format
 
@@ -573,6 +622,37 @@ needs `pytest-cov` from the backend `dev` extra. Install the **`test`** extra to
 run the *full* backend suite — without the optional engines
 (geopandas/rasterio/sedona/httpx) the vector/raster/SQL/ML tests skip themselves
 and CI is green but hollow: `pip install -e "backend/geolibre_server[test]"`.
+
+## Lint warning ratchet
+
+`npm run lint` passes `--max-warnings` (in the root `package.json`) set to the
+current warning count, so lint warnings work like the coverage floors: the
+count can only go down. The warnings come from `react-hooks/exhaustive-deps`,
+`@typescript-eslint/no-explicit-any`, the type-aware
+`@typescript-eslint/no-floating-promises` (app, package and worker `src/`
+only, checked against each file's nearest `tsconfig.json`), and
+`local/no-physical-tailwind` (`eslint-rules/no-physical-tailwind.mjs`, the
+right-to-left rule from [Internationalization](i18n.md#right-to-left-languages)),
+and two `eslint-plugin-jsx-a11y` rules (`control-has-associated-label`,
+`no-static-element-interactions`) on app and package `.tsx`.
+
+`eslint-plugin-jsx-a11y` 6.10 declares ESLint up to 9 as a peer. It runs under
+ESLint 10, and the `overrides` entry for it in the root `package.json` points its
+peer at the installed ESLint. When the plugin publishes ESLint 10 support, drop
+that override. If a future ESLint breaks the plugin, `npm run lint` fails
+loudly; pin ESLint or disable the two rules rather than reaching for
+`--legacy-peer-deps`.
+
+- **A PR adds a warning:** fix it. For a floating promise that is a deliberate
+  fire-and-forget, prefix the call with `void` and make sure it handles its own
+  rejection. For a class that must stay physical (a map-anchored overlay, say),
+  add `// eslint-disable-next-line local/no-physical-tailwind -- <why>`. Do
+  not raise the limit.
+- **A PR fixes warnings:** lower the limit to the new total that ESLint prints,
+  in the same PR, so the gain is kept.
+- **A PR turns on a new rule:** the one time the limit goes up. Raise it by
+  exactly the new rule's count on the code as it is, say so in the PR, and fix
+  those warnings over time like the rest.
 
 ## Dependency updates and the audit allowlist
 

@@ -26,6 +26,7 @@ import {
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type PointerEvent as ReactPointerEvent,
@@ -77,12 +78,14 @@ interface ProjectGalleryDialogProps {
     authToken?: string,
     options?: {
       asCopy?: boolean;
+      oauthSessionRevision?: number;
       remoteProject?: {
         id: string;
         versionCount: number;
         canEdit: boolean;
         token: string;
         baseUrl: string;
+        oauthSessionRevision?: number;
       };
     },
   ) => Promise<void>;
@@ -144,10 +147,12 @@ export function ProjectGalleryDialog({
 }: ProjectGalleryDialogProps) {
   const { t } = useTranslation();
   const trimmedToken = (useDesktopSettingsStore((s) => s.desktopSettings.shareToken) ?? "").trim();
-  // Web-only OAuth session; on desktop/embed both flags stay inert and the
-  // personal-API-token behavior is unchanged.
+  // A project OAuth session can change on both web and desktop. A pasted PAT
+  // remains usable independently, but private data from the old OAuth account
+  // must be dropped before the next paint.
   const oauthSupported = supportsShareOAuth();
   const oauthIssuer = useShareOAuthStore((s) => s.issuer);
+  const oauthSessionRevision = useShareOAuthStore((s) => s.sessionRevision);
   const oauthPending = useShareOAuthStore((s) => s.pending);
   const oauthSignedIn = oauthSupported && oauthIssuer !== null;
   const hasToken = oauthSignedIn || trimmedToken.length > 0;
@@ -171,6 +176,7 @@ export function ProjectGalleryDialog({
   const membershipAbortRef = useRef<AbortController | null>(null);
   const defaultScopePendingRef = useRef(true);
   const reloadGenerationRef = useRef(0);
+  const previousSessionRevisionRef = useRef(oauthSessionRevision);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const loadMoreSentinelRef = useRef<HTMLDivElement>(null);
   // The resolved Bearer credential (OAuth access token when signed in, else
@@ -336,16 +342,21 @@ export function ProjectGalleryDialog({
     },
     [t, effectiveScope, trimmedToken, oauthSupported],
   );
-  // Web sign-in from the gallery. Keep the current error visible while the
-  // popup is pending; a successful sign-in reloads the active scope explicitly
-  // because the issuer may remain unchanged.
+  useLayoutEffect(() => {
+    if (previousSessionRevisionRef.current === oauthSessionRevision) return;
+    previousSessionRevisionRef.current = oauthSessionRevision;
+    abortRef.current?.abort();
+    membershipAbortRef.current?.abort();
+    setProjects([]);
+    setRequestToken("");
+    setOrganizations([]);
+    setGroups([]);
+    setOpeningState(null);
+  }, [oauthSessionRevision]);
+
   const handleSignIn = () => {
     signInToShare()
-      .then(() => {
-        setErrorCode(null);
-        setProjects([]);
-        void loadPage(0);
-      })
+      .then(() => setErrorCode(null))
       .catch((err: unknown) => {
         setError(
           t(err instanceof ShareOAuthError ? shareOAuthErrorKey(err.code) : "share.oauthFailed"),
@@ -371,7 +382,7 @@ export function ProjectGalleryDialog({
       abortRef.current?.abort();
       abortRef.current = null;
     }
-  }, [open, loadPage]);
+  }, [open, loadPage, oauthSessionRevision]);
 
   useEffect(() => {
     if (!open || !hasToken) {
@@ -417,7 +428,7 @@ export function ProjectGalleryDialog({
       controller.abort();
       if (membershipAbortRef.current === controller) membershipAbortRef.current = null;
     };
-  }, [open, hasToken, trimmedToken, oauthIssuer]);
+  }, [open, hasToken, trimmedToken, oauthIssuer, oauthSessionRevision]);
 
   const selectScope = (nextScope: GalleryScope) => {
     defaultScopePendingRef.current = false;
@@ -441,6 +452,8 @@ export function ProjectGalleryDialog({
           : "";
       await onOpenProject(project.rawJsonUrl, projectOpenToken(project, token), {
         asCopy,
+        oauthSessionRevision:
+          oauthIssuer && token !== trimmedToken ? oauthSessionRevision : undefined,
         remoteProject: asCopy
           ? undefined
           : {
@@ -451,6 +464,8 @@ export function ProjectGalleryDialog({
               // OAuth access token at save time.
               token: trimmedToken,
               baseUrl: resolveShareBaseUrl() ?? "",
+              oauthSessionRevision:
+                oauthIssuer && token !== trimmedToken ? oauthSessionRevision : undefined,
             },
       });
       onOpenChange(false);

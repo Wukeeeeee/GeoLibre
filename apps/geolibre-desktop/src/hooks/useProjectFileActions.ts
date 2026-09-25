@@ -56,6 +56,7 @@ import {
   ShareOAuthError,
   shareOAuthErrorKey,
   supportsShareOAuth,
+  useShareOAuthStore,
 } from "../lib/share-oauth";
 import { shareAuthorizedFetch } from "../lib/share-gallery";
 import { normalizeProjectUrl } from "../lib/urls";
@@ -180,6 +181,7 @@ export interface RemoteSharedProjectTarget {
   canEdit: boolean;
   token: string;
   baseUrl: string;
+  oauthSessionRevision?: number;
 }
 
 /**
@@ -343,6 +345,22 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
   const remoteProjectRef = useRef<
     (RemoteSharedProjectTarget & { projectGeneration: number }) | null
   >(null);
+  // Do not keep a remote edit target after its OAuth project session changes.
+  // The loaded map remains available for a local Save As.
+  useLayoutEffect(
+    () =>
+      useShareOAuthStore.subscribe((state) => {
+        const target = remoteProjectRef.current;
+        if (
+          target?.oauthSessionRevision !== undefined &&
+          target.oauthSessionRevision !== state.sessionRevision
+        ) {
+          remoteProjectRef.current = null;
+          setRemoteSaveWarning(null);
+        }
+      }),
+    [],
+  );
 
   // Settling a prompt means resolving its promise and clearing the dialog
   // state. Each pattern lives here once so the dialog handlers further down and
@@ -823,6 +841,7 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
     options: {
       authToken?: string;
       asCopy?: boolean;
+      oauthSessionRevision?: number;
       remoteProject?: RemoteSharedProjectTarget;
     } = {},
   ): Promise<void> => {
@@ -857,6 +876,11 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
       }
 
       if (controller.signal.aborted) return;
+      if (
+        options.oauthSessionRevision !== undefined &&
+        options.oauthSessionRevision !== useShareOAuthStore.getState().sessionRevision
+      )
+        return;
 
       if (options.asCopy) {
         const detached = detachProjectCopy(project, { nameSuffix: "" });
@@ -1344,6 +1368,12 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
         // Re-resolved per save: an OAuth access token captured at open time
         // may have expired; `remoteProject.token` is the personal-token fallback.
         const token = await resolveShareRequestToken(remoteProject.token, remoteProject.baseUrl);
+        if (
+          remoteProject !== remoteProjectRef.current ||
+          (remoteProject.oauthSessionRevision !== undefined &&
+            remoteProject.oauthSessionRevision !== useShareOAuthStore.getState().sessionRevision)
+        )
+          return false;
         const updated = await updateSharedProjectContent({
           token,
           projectId: remoteProject.id,
@@ -1351,7 +1381,13 @@ export function useProjectFileActions(mapControllerRef: MapControllerRef) {
           expectedVersion: remoteProject.versionCount,
           baseUrl: remoteProject.baseUrl,
         });
-        if (useAppStore.getState().projectGeneration !== saveProjectGeneration) return false;
+        if (
+          useAppStore.getState().projectGeneration !== saveProjectGeneration ||
+          remoteProject !== remoteProjectRef.current ||
+          (remoteProject.oauthSessionRevision !== undefined &&
+            remoteProject.oauthSessionRevision !== useShareOAuthStore.getState().sessionRevision)
+        )
+          return false;
         const updatedRemoteProject = {
           ...remoteProject,
           versionCount: updated.versionCount,

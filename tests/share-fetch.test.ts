@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, describe, it } from "node:test";
 import { createEmptyProject, serializeProject } from "@geolibre/core";
 import {
+  createNativeShareFetch,
   getShareFetch,
   requestOrigin,
   resetShareFetch,
@@ -11,6 +12,7 @@ import { uploadProjectToShare } from "../apps/geolibre-desktop/src/lib/share-geo
 import {
   fetchMyProjects,
   fetchSharedProjects,
+  shareAuthorizedFetch,
 } from "../apps/geolibre-desktop/src/lib/share-gallery";
 
 // A minimal JSON Response for a share endpoint.
@@ -151,5 +153,98 @@ describe("requestOrigin", () => {
   it("returns null for values that have no real origin", () => {
     assert.equal(requestOrigin("not a url"), null);
     assert.equal(requestOrigin("mailto:someone@example.org"), null);
+  });
+});
+
+describe("native share transport", () => {
+  it("uses native HTTP only for the shipped HTTPS origin, and never retries self-host CORS failures", async () => {
+    const nativeUrls: string[] = [];
+    const browserUrls: string[] = [];
+    const native = (async (input: RequestInfo | URL) => {
+      nativeUrls.push(input instanceof Request ? input.url : String(input));
+      return new Response("native");
+    }) as Parameters<typeof createNativeShareFetch>[0];
+    const browser = (async (input: RequestInfo | URL) => {
+      const url = input instanceof Request ? input.url : String(input);
+      browserUrls.push(url);
+      if (url.includes("self-hosted.example")) throw new TypeError("CORS denied");
+      return new Response("browser");
+    }) as typeof fetch;
+    const shareFetch = createNativeShareFetch(native, browser);
+
+    assert.equal(
+      await (await shareFetch("https://share.geolibre.app/api/projects")).text(),
+      "native",
+    );
+    assert.equal(
+      await (await shareFetch(new Request("https://share.geolibre.app/api/users/me"))).text(),
+      "native",
+    );
+    assert.equal(
+      await (await shareFetch(new URL("https://share.geolibre.app/api/projects"))).text(),
+      "native",
+    );
+    assert.equal(
+      await (await shareFetch("http://share.geolibre.app/api/projects")).text(),
+      "browser",
+    );
+    assert.equal(
+      await (await shareFetch("https://share.geolibre.app:8443/api/projects")).text(),
+      "browser",
+    );
+    assert.equal(await (await shareFetch("https://tiles.example.com/xyz")).text(), "browser");
+    await assert.rejects(shareFetch("https://self-hosted.example/api/projects"), /CORS denied/);
+    assert.equal(nativeUrls.length, 3);
+    assert.equal(browserUrls.length, 4);
+  });
+
+  it("disables native redirects for credentials and rejects 3xx instead of exposing a redirect target", async () => {
+    const redirected: string[] = [];
+    const options: Array<(RequestInit & { maxRedirections?: number }) | undefined> = [];
+    const native = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit & { maxRedirections?: number },
+    ) => {
+      options.push(init);
+      if (init?.maxRedirections === 0) {
+        return new Response(null, {
+          status: 302,
+          headers: { Location: "https://attacker.example/collect" },
+        });
+      }
+      redirected.push("https://attacker.example/collect");
+      return new Response("followed");
+    }) as Parameters<typeof createNativeShareFetch>[0];
+    const shareFetch = createNativeShareFetch(native);
+    const authed = shareAuthorizedFetch("private", "https://share.geolibre.app", shareFetch);
+
+    await assert.rejects(authed("https://share.geolibre.app/api/users/me"), /Redirect refused/);
+    await assert.rejects(
+      shareFetch(
+        new Request("https://share.geolibre.app/private", {
+          headers: { Authorization: "Bearer private" },
+        }),
+      ),
+      /Redirect refused/,
+    );
+    await assert.rejects(
+      shareFetch("https://share.geolibre.app/api/projects", {
+        method: "POST",
+        headers: { Authorization: "Bearer private" },
+      }),
+      /Redirect refused/,
+    );
+    assert.equal(options[0]?.maxRedirections, 0);
+    assert.equal(options[0]?.redirect, "error");
+    assert.equal(options[1]?.maxRedirections, 0);
+    assert.equal(options[2]?.maxRedirections, 0);
+    assert.deepEqual(redirected, []);
+
+    assert.equal(
+      await (await shareFetch("https://share.geolibre.app/api/projects")).text(),
+      "followed",
+    );
+    assert.equal(options[3]?.maxRedirections, undefined);
+    assert.deepEqual(redirected, ["https://attacker.example/collect"]);
   });
 });

@@ -40,7 +40,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Callable, Iterator
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, delete, func, or_, select, update
@@ -62,14 +62,15 @@ from geolibre_server_api.auth_models import (
 # ---------------------------------------------------------------------------
 
 PROJECT_SCOPES = ("read:projects", "write:projects", "share:public")
-# Reserved for later organization and session-management stacks.
-RESERVED_SCOPES = ("admin:org", "manage:sessions")
-KNOWN_SCOPES = PROJECT_SCOPES
-SCOPE_ORDER = PROJECT_SCOPES
+MANAGEMENT_SCOPE = "manage:sessions"
+RESERVED_SCOPES = ("admin:org",)
+KNOWN_SCOPES = (*PROJECT_SCOPES, MANAGEMENT_SCOPE)
+SCOPE_ORDER = KNOWN_SCOPES
 PAT_MAX_DAYS = 365
 
 DEFAULT_CODE_TTL_SECONDS = 60
 DEFAULT_ACCESS_TTL_SECONDS = 600
+MANAGEMENT_TTL_SECONDS = 300
 DEFAULT_REFRESH_TTL_SECONDS = 2592000  # 30 days; rotation never extends it.
 INTERACTION_TTL_SECONDS = 600
 MAX_FORM_BYTES = 16 * 1024
@@ -713,6 +714,8 @@ def parse_scope_set(scope: str) -> frozenset[str] | None:
         return None
     if any(part not in KNOWN_SCOPES or part in RESERVED_SCOPES for part in parts):
         return None
+    if MANAGEMENT_SCOPE in parts and len(parts) != 1:
+        return None
     return frozenset(parts)
 
 
@@ -729,6 +732,9 @@ def scope_description(scope: str) -> str:
         "read:projects": "List and open your projects, including private ones",
         "write:projects": "Create, update, and delete your projects",
         "share:public": "Make your projects publicly visible",
+        MANAGEMENT_SCOPE: (
+            "List and revoke every sign-in session and personal token on your account"
+        ),
     }[scope]
 
 
@@ -816,7 +822,7 @@ def render_consent_form(
         "<title>Authorize GeoLibre</title></head><body>"
         f"<h1>Authorize {html.escape(client.name)}</h1>"
         f"<p>Sign in to <strong>{html.escape(config.issuer)}</strong> and allow "
-        f"<strong>{html.escape(client.name)}</strong> to access your projects.</p>"
+        f"<strong>{html.escape(client.name)}</strong> to access your account.</p>"
         f"<p>You will be returned to <strong>{html.escape(redirect_uri)}</strong>.</p>"
         "<h2>Requested access</h2>"
         f"<ul>{scope_items}</ul>"
@@ -974,6 +980,40 @@ class AccountPatch(BaseModel):
     email: str | None = Field(max_length=320)
 
     model_config = {"extra": "forbid"}
+
+
+class RevokeOtherSessionsRequest(BaseModel):
+    currentSessionId: str
+
+    model_config = {"extra": "forbid"}
+
+
+def owned_project_session(
+    session: Session, account_id: str, session_id: str, now_ts: int, *, lock: bool = False
+) -> OAuthSession:
+    query = select(OAuthSession).where(
+        OAuthSession.id == session_id,
+        OAuthSession.account_id == account_id,
+        OAuthSession.kind == "project",
+        OAuthSession.revoked_at.is_(None),
+        OAuthSession.expires_at > now_ts,
+    )
+    if lock:
+        query = query.with_for_update()
+    project = session.scalar(query)
+    if project is None:
+        raise HTTPException(404, "not found")
+    return project
+
+
+def backfill_account_policies(session: Session, account_id: str) -> None:
+    missing = session.scalars(
+        select(Token.digest)
+        .outerjoin(PersonalTokenPolicy, PersonalTokenPolicy.token_digest == Token.digest)
+        .where(Token.account_id == account_id, PersonalTokenPolicy.id.is_(None))
+    ).all()
+    for digest in missing:
+        backfill_policy(session, digest)
 
 
 def _validate_pat_lifetime(days: int | None) -> None:
@@ -1135,6 +1175,190 @@ def build_identity_router() -> APIRouter:
             "scopes": sorted(principal.scopes, key=SCOPE_ORDER.index),
         }
 
+    @router.get("/api/auth/sessions")
+    def list_auth_sessions(
+        response: Response,
+        request: Request,
+        limit: int = Query(50, ge=1, le=100),
+        offset: int = Query(0, ge=0),
+        currentSessionId: str | None = None,
+        principal: AuthPrincipal = Depends(require_scope(MANAGEMENT_SCOPE)),
+        session: Session = Depends(get_session),
+    ):
+        """List active project grants and personal tokens, never manager grants.
+
+        Legacy PATs are backfilled before exposure because their policy row
+        carries the public revocable ID; the per-account SELECT plus any
+        single-row commits is deliberate and cheap for typical accounts. Rows
+        are then sorted and sliced in Python rather than in SQL so the
+        mixed-kind ordering (oauth + personal-token) stays deterministic and
+        the total reflects every active credential family.
+        """
+        now_ts = get_clock(request)()
+        account_id = principal.account.id
+        if currentSessionId is not None:
+            owned_project_session(session, account_id, currentSessionId, now_ts)
+        backfill_account_policies(session, account_id)
+
+        rows: list[tuple[float, dict]] = []
+        for grant in session.scalars(
+            select(OAuthSession).where(
+                OAuthSession.account_id == account_id,
+                OAuthSession.kind == "project",
+                OAuthSession.revoked_at.is_(None),
+                OAuthSession.expires_at > now_ts,
+            )
+        ):
+            rows.append(
+                (
+                    float(grant.created_at),
+                    {
+                        "id": grant.id,
+                        "kind": "oauth",
+                        "clientId": grant.client_id,
+                        "label": grant.label,
+                        "scopes": grant.scope.split(),
+                        "createdAt": iso_ts(grant.created_at),
+                        "lastUsedAt": iso_ts(grant.last_used_at)
+                        if grant.last_used_at is not None
+                        else None,
+                        "expiresAt": iso_ts(grant.expires_at),
+                        "current": grant.id == currentSessionId,
+                        "legacy": False,
+                    },
+                )
+            )
+        policies = session.execute(
+            select(Token, PersonalTokenPolicy)
+            .join(PersonalTokenPolicy, PersonalTokenPolicy.token_digest == Token.digest)
+            .where(
+                Token.account_id == account_id,
+                PersonalTokenPolicy.revoked_at.is_(None),
+                or_(
+                    PersonalTokenPolicy.expires_at.is_(None),
+                    PersonalTokenPolicy.expires_at > now_ts,
+                ),
+            )
+        )
+        for token, policy in policies:
+            rows.append(
+                (
+                    datetime.fromisoformat(token.created_at.replace("Z", "+00:00")).timestamp(),
+                    {
+                        "id": policy.id,
+                        "kind": "personal-token",
+                        "clientId": None,
+                        "label": policy.label,
+                        "scopes": policy.scope.split(),
+                        "createdAt": token.created_at,
+                        "lastUsedAt": iso_ts(policy.last_used_at)
+                        if policy.last_used_at is not None
+                        else None,
+                        "expiresAt": iso_ts(policy.expires_at)
+                        if policy.expires_at is not None
+                        else None,
+                        "current": False,
+                        "legacy": policy.legacy,
+                    },
+                )
+            )
+        rows.sort(key=lambda entry: (entry[0], entry[1]["id"]), reverse=True)
+        response.headers["Cache-Control"] = "private, no-store"
+        return {
+            "sessions": [item for _, item in rows[offset : offset + limit]],
+            "limit": limit,
+            "offset": offset,
+            "total": len(rows),
+        }
+
+    @router.delete("/api/auth/sessions/{session_id}", status_code=204)
+    def revoke_auth_session(
+        session_id: str,
+        request: Request,
+        principal: AuthPrincipal = Depends(require_scope(MANAGEMENT_SCOPE)),
+        session: Session = Depends(get_session),
+    ):
+        """Revoke an owned session family or a PAT by its public UUID."""
+        account_id = principal.account.id
+        grant = session.scalar(
+            select(OAuthSession.id).where(
+                OAuthSession.id == session_id,
+                OAuthSession.account_id == account_id,
+                OAuthSession.kind == "project",
+            )
+        )
+        if grant is not None:
+            session.execute(
+                update(OAuthSession)
+                .where(OAuthSession.id == grant, OAuthSession.revoked_at.is_(None))
+                .values(revoked_at=get_clock(request)())
+            )
+        else:
+            backfill_account_policies(session, account_id)
+            policy = session.scalar(
+                select(PersonalTokenPolicy.id)
+                .join(Token, Token.digest == PersonalTokenPolicy.token_digest)
+                .where(PersonalTokenPolicy.id == session_id, Token.account_id == account_id)
+            )
+            if policy is None:
+                raise HTTPException(404, "not found")
+            session.execute(
+                update(PersonalTokenPolicy)
+                .where(PersonalTokenPolicy.id == policy, PersonalTokenPolicy.revoked_at.is_(None))
+                .values(revoked_at=get_clock(request)())
+            )
+        session.commit()
+
+    @router.post("/api/auth/sessions/revoke-others", status_code=204)
+    def revoke_other_auth_sessions(
+        body: RevokeOtherSessionsRequest,
+        request: Request,
+        principal: AuthPrincipal = Depends(require_scope(MANAGEMENT_SCOPE)),
+        session: Session = Depends(get_session),
+    ):
+        """Atomically retire all other credential families and every PAT."""
+        account_id = principal.account.id
+        now_ts = get_clock(request)()
+        backfill_account_policies(session, account_id)
+        # Lock the calling manager and the kept project family before mutating
+        # anything; refresh and revocation serialize on OAuthSession rows.
+        manager = session.scalar(
+            select(OAuthSession)
+            .where(
+                OAuthSession.id == principal.session_id,
+                OAuthSession.account_id == account_id,
+                OAuthSession.kind == "management",
+                OAuthSession.revoked_at.is_(None),
+                OAuthSession.expires_at > now_ts,
+            )
+            .with_for_update()
+        )
+        if manager is None:
+            raise HTTPException(
+                401, "invalid or expired token", headers=bearer_challenge("invalid_token")
+            )
+        owned_project_session(session, account_id, body.currentSessionId, now_ts, lock=True)
+        session.execute(
+            update(OAuthSession)
+            .where(
+                OAuthSession.account_id == account_id,
+                OAuthSession.id.not_in((body.currentSessionId, manager.id)),
+                OAuthSession.revoked_at.is_(None),
+            )
+            .values(revoked_at=now_ts)
+        )
+        session.execute(
+            update(PersonalTokenPolicy)
+            .where(
+                PersonalTokenPolicy.token_digest.in_(
+                    select(Token.digest).where(Token.account_id == account_id)
+                ),
+                PersonalTokenPolicy.revoked_at.is_(None),
+            )
+            .values(revoked_at=now_ts)
+        )
+        session.commit()
+
     return router
 
 
@@ -1147,6 +1371,10 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
     """Build the Authorization Code + S256 PKCE surface for an enabled server."""
 
     router = APIRouter(dependencies=[Depends(require_issuer_host(config))])
+    # __Host- cookies require Secure; Safari rejects Secure cookies on HTTP
+    # loopback, which is permitted only for local development by parse_issuer.
+    secure_cookie = config.issuer.startswith("https://")
+    browser_cookie = BROWSER_COOKIE if secure_cookie else "geolibre_oauth_browser"
 
     # -- GET /oauth/authorize: start a pending interaction and render consent --
 
@@ -1202,7 +1430,7 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
         cleanup_expired_security_rows(session, now_ts)
         cookie_value: str | None = None
         cookie_digest: str | None = None
-        existing = request.cookies.get(BROWSER_COOKIE)
+        existing = request.cookies.get(browser_cookie)
         if existing:
             existing_digest = token_digest(existing)
             # One browser cookie binds simultaneous consent forms for every
@@ -1263,11 +1491,11 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
             form_redirect_uri=redirect_uri,
         )
         response.set_cookie(
-            BROWSER_COOKIE,
+            browser_cookie,
             cookie_value,
             max_age=config.interaction_ttl,
             httponly=True,
-            secure=True,
+            secure=secure_cookie,
             samesite="lax",
             path="/",
         )
@@ -1328,7 +1556,7 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
             return oauth_error_page(
                 400, "invalid_request", "authorization request expired or already processed"
             )
-        cookie = request.cookies.get(BROWSER_COOKIE)
+        cookie = request.cookies.get(browser_cookie)
         if (
             not cookie
             or interaction.browser_cookie_digest is None
@@ -1489,13 +1717,14 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
             return oauth_token_error(400, "invalid_grant")
 
         session_id = str(uuid.uuid4())
-        family_expires = now_ts + config.refresh_ttl
+        management = code_row.scope == MANAGEMENT_SCOPE
+        family_expires = now_ts + (MANAGEMENT_TTL_SECONDS if management else config.refresh_ttl)
         access_expires = min(now_ts + config.access_ttl, family_expires)
         oauth_session = OAuthSession(
             id=session_id,
             account_id=code_row.account_id,
             client_id=client.client_id,
-            kind="project",
+            kind="management" if management else "project",
             scope=code_row.scope,
             label=code_row.label,
             created_at=now_ts,
@@ -1503,10 +1732,8 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
             rotation_version=0,
         )
         access_value = secrets.token_urlsafe(32)
-        refresh_value = secrets.token_urlsafe(32)
         session.add(oauth_session)
-        # Flush the family row before its tokens: no ORM relationship orders
-        # these tables, and the enforced FK needs the session row to exist.
+        # The FK requires the family row before its access token.
         session.flush()
         session.add(
             OAuthAccessToken(
@@ -1516,14 +1743,16 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
                 expires_at=access_expires,
             )
         )
-        session.add(
-            OAuthRefreshToken(
-                digest=token_digest(refresh_value),
-                session_id=session_id,
-                created_at=now_ts,
-                expires_at=family_expires,
+        if not management:
+            refresh_value = secrets.token_urlsafe(32)
+            session.add(
+                OAuthRefreshToken(
+                    digest=token_digest(refresh_value),
+                    session_id=session_id,
+                    created_at=now_ts,
+                    expires_at=family_expires,
+                )
             )
-        )
         code_id = code_row.id
         consumed = session.execute(
             update(OAuthAuthorizationCode)
@@ -1549,15 +1778,15 @@ def build_oauth_router(config: OAuthConfig) -> APIRouter:
                 session.commit()
             return oauth_token_error(400, "invalid_grant")
         session.commit()
-        return oauth_token_response(
-            {
-                "access_token": access_value,
-                "token_type": "Bearer",
-                "expires_in": access_expires - now_ts,
-                "refresh_token": refresh_value,
-                "scope": code_row.scope,
-            }
-        )
+        payload = {
+            "access_token": access_value,
+            "token_type": "Bearer",
+            "expires_in": access_expires - now_ts,
+            "scope": code_row.scope,
+        }
+        if not management:
+            payload["refresh_token"] = refresh_value
+        return oauth_token_response(payload)
 
     def refresh_tokens(
         fields: dict[str, str], client: OAuthClient, session: Session, now_ts: int

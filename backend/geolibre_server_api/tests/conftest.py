@@ -17,13 +17,13 @@ OAUTH_CLIENTS = [
         "client_id": "geolibre-web",
         "name": "GeoLibre Web",
         "redirect_uris": [WEB_REDIRECT],
-        "scopes": ["read:projects", "write:projects", "share:public"],
+        "scopes": ["read:projects", "write:projects", "share:public", "manage:sessions"],
     },
     {
         "client_id": "geolibre-desktop",
         "name": "GeoLibre Desktop",
         "redirect_uris": [DESKTOP_REDIRECT],
-        "scopes": ["read:projects", "write:projects", "share:public"],
+        "scopes": ["read:projects", "write:projects", "share:public", "manage:sessions"],
     },
 ]
 

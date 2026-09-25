@@ -383,6 +383,11 @@ let unregisterPanel: (() => void) | null = null;
 let disposePanel: (() => void) | null = null;
 let panelContainer: HTMLElement | null = null;
 let initialCatalogUrl = "";
+// A catalog asked for from outside the panel (the `?stac=` deep link), taking the place of the
+// plugin's own preset on its next activation.
+let requestedCatalogUrl = "";
+// Which createStacPlugin() instance owns the shared state above, since they all share it.
+let activePluginId: string | null = null;
 interface CatalogBrowserOptions {
   loadIndex?: typeof loadStacIndex;
   indexFromConnection?: (connection: StacConnection) => StacIndexCatalog[];
@@ -1421,14 +1426,19 @@ function buildPanel(container: HTMLElement): () => void {
     return labels.showing(allItems.length);
   };
 
-  // A double-click means the same here as in the tree: search this one.
-  collectionSelect.addEventListener("dblclick", () => {
+  /** Search the chosen collection and send the map to its extent. */
+  function searchChosenCollection(): void {
     const chosen = collectionSelect.selectedOptions[0]?.value;
     const extent = connection?.collections.find((collection) => collection.id === chosen)?.extent;
     const box = horizontalBbox(extent?.spatial?.bbox?.[0]);
-    void runSearch(false);
+    // The map is only on its way to the collection, so "limit to map extent" would still read the
+    // bounds it is leaving. The collection's own extent stands in for them; a typed bbox still wins.
+    const inView = useExtent.checked && !bboxField.input.value.trim() ? box : undefined;
+    void runSearch(false, undefined, inView);
     if (box) appRef?.fitBounds?.(box);
-  });
+  }
+  // A double-click means the same here as in the tree: search this one.
+  collectionSelect.addEventListener("dblclick", searchChosenCollection);
 
   /** The tree asked for a collection: search it, and send the map to it. */
   function showCollection(href: string, bbox?: [number, number, number, number]): void {
@@ -1453,7 +1463,11 @@ function buildPanel(container: HTMLElement): () => void {
    * The caller may take it first, when it has its own late answer to check; taking it here would
    * mean it moves on a call that does nothing.
    */
-  async function runSearch(append: boolean, generation?: number): Promise<void> {
+  async function runSearch(
+    append: boolean,
+    generation?: number,
+    extent?: [number, number, number, number],
+  ): Promise<void> {
     if (!connection) return;
     const search = generation ?? ++searchGeneration;
 
@@ -1471,7 +1485,7 @@ function buildPanel(container: HTMLElement): () => void {
       walking = new AbortController();
       const reading = AbortSignal.any([walking.signal, controller.signal]);
       const options = {
-        bbox: parseBbox(),
+        bbox: extent ?? parseBbox(),
         datetime,
         collections: selectedCollections,
         entries: connection.isApi ? [] : tree.selection(),
@@ -1546,6 +1560,16 @@ function buildPanel(container: HTMLElement): () => void {
       renderSection.hidden = false;
       clearSearchResults(false);
       setStatus(connection.description || labels.connected);
+      // The URL named one collection of an API: search it, as a double-click on it would.
+      const focus = connection.focusCollection;
+      const focusOption = Array.from(collectionSelect.options).find(
+        (option) => option.value === focus,
+      );
+      if (focusOption) {
+        focusOption.selected = true;
+        focusOption.scrollIntoView?.({ block: "nearest" });
+        searchChosenCollection();
+      }
       return connection;
     } catch (error) {
       connection = null;
@@ -1665,6 +1689,32 @@ function mountPanel(container: HTMLElement): void {
   disposePanel = buildPanel(container);
 }
 
+/** Drop a {@link requestStacCatalogUrl} request no activation took up. */
+export function cancelStacCatalogRequest(): void {
+  requestedCatalogUrl = "";
+}
+
+/**
+ * Open the STAC Catalogs browser on a catalog, API, or API collection URL and connect to it.
+ *
+ * Takes effect on the STAC Catalogs plugin's next activation, or at once when it is already active.
+ *
+ * Args:
+ *   url: The STAC URL to connect to.
+ */
+export function requestStacCatalogUrl(url: string): void {
+  // Only the STAC Catalogs browser takes the request in place. A sibling's (Planet, Portolan) state
+  // is left for the activation that replaces it, which reads the request.
+  if (activePluginId !== STAC_PLUGIN_ID) {
+    requestedCatalogUrl = url;
+    return;
+  }
+  initialCatalogUrl = url;
+  if (panelContainer) mountPanel(panelContainer);
+  // Active with its panel closed: opening the panel mounts it on the requested catalog.
+  else appRef?.openRightPanel?.(STAC_PLUGIN_ID);
+}
+
 /**
  * Factory creating a STAC catalog browser plugin instance with optional preset catalog URL.
  *
@@ -1687,7 +1737,10 @@ function createStacPlugin(
     engines: ["maplibre", "mapbox"],
     exclusiveGroup: "stac-catalog-browser",
     activate(app) {
-      initialCatalogUrl = presetCatalogUrl;
+      // The `?stac=` request is for the STAC Catalogs browser, never a sibling preset.
+      initialCatalogUrl = (id === STAC_PLUGIN_ID && requestedCatalogUrl) || presetCatalogUrl;
+      if (id === STAC_PLUGIN_ID) requestedCatalogUrl = "";
+      activePluginId = id;
       browserOptions = options;
       appRef = app;
       unregisterPanel =
@@ -1723,6 +1776,7 @@ function createStacPlugin(
         removeSelectionHighlight(map);
       }
       appRef = null;
+      activePluginId = null;
       initialCatalogUrl = "";
       browserOptions = {};
     },

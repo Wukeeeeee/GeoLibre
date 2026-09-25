@@ -50,6 +50,15 @@ export const PROVIDER_FIELDS = {
       required: true,
     },
   ],
+  openrouter: [
+    {
+      envKey: "OPENROUTER_API_KEY",
+      labelKey: "settings.ai.field.apiKey",
+      placeholderKey: "settings.ai.placeholder.openrouterKey",
+      secret: true,
+      required: true,
+    },
+  ],
   ollama: [
     {
       envKey: "OLLAMA_BASE_URL",
@@ -134,6 +143,7 @@ export const PROVIDER_DOCS_URL: Partial<Record<AssistantProviderId, string>> = {
   google: "https://aistudio.google.com/apikey",
   anthropic: "https://console.anthropic.com/settings/keys",
   openai: "https://platform.openai.com/api-keys",
+  openrouter: "https://openrouter.ai/settings/keys",
   ollama: "https://ollama.com/download",
   bedrock: "https://docs.aws.amazon.com/bedrock/latest/userguide/getting-started.html",
 };

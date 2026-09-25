@@ -30,9 +30,11 @@ import { useTranslation } from "react-i18next";
 import { AssistantSession } from "../../lib/assistant/agent";
 import { renderAssistantMarkdown } from "../../lib/assistant/markdown";
 import { isOllamaNetworkFailure, withOllamaOriginHint } from "../../lib/assistant/ollama";
-import { selectActiveAssistantProfile } from "../../lib/assistant/profiles";
+import { configForProfile, selectActiveAssistantProfile } from "../../lib/assistant/profiles";
 import { isSendKey } from "../../lib/assistant/send-key";
 import { openSettingsSection } from "../layout/SettingsDialog";
+import { bedrockAuthFromConfig, hasModelPicker } from "../../lib/assistant/model-discovery";
+import { ProviderModelPicker } from "../ProviderModelPicker";
 import {
   ASSISTANT_PROVIDER_IDS,
   availableProviders,
@@ -75,6 +77,7 @@ const SETUP_PROVIDERS: ReadonlyArray<{
   { id: "google", envs: ["GEMINI_API_KEY"] },
   { id: "anthropic", envs: ["ANTHROPIC_API_KEY"] },
   { id: "openai", envs: ["OPENAI_API_KEY"] },
+  { id: "openrouter", envs: ["OPENROUTER_API_KEY"] },
   { id: "ollama", envs: ["OLLAMA_BASE_URL"] },
   { id: "bedrock", envs: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"] },
   { id: "custom", envs: ["OPENAI_COMPATIBLE_BASE_URL", "OPENAI_COMPATIBLE_MODEL"] },
@@ -231,6 +234,13 @@ export function AssistantPanel({ mapControllerRef }: AssistantPanelProps) {
       deploymentProxyConfigured,
     });
   }, [selectedProfileId, aiProfiles, defaultAiProfileId, deploymentProxyConfigured]);
+  // The model picker's discovery credentials, resolved only when the picker is
+  // shown. Not memoized: the runtime env it reads can change without the
+  // profile changing.
+  const activeProfileConfig =
+    activeProfile && hasModelPicker(activeProfile.provider)
+      ? configForProfile(activeProfile)
+      : null;
 
   // Queue of model-generated code snippets (run_python / run_maplibre_js)
   // awaiting the user's approval, each with the promise resolver its tool
@@ -770,25 +780,38 @@ export function AssistantPanel({ mapControllerRef }: AssistantPanelProps) {
                 ))}
               </Select>
               {activeProfile && PROVIDER_MODELS[activeProfile.provider].length > 0 ? (
-                <Select
-                  aria-label={t("assistant.model")}
-                  className="h-8 w-auto max-w-[180px] text-xs"
-                  value={activeProfile.modelId || defaultModelFor(activeProfile.provider)}
-                  disabled={running}
-                  onChange={(event) => onModelChange(event.target.value)}
-                >
-                  {[
-                    ...new Set(
-                      [activeProfile.modelId, ...PROVIDER_MODELS[activeProfile.provider]].filter(
-                        Boolean,
+                hasModelPicker(activeProfile.provider) ? (
+                  <ProviderModelPicker
+                    key={activeProfile.id}
+                    provider={activeProfile.provider}
+                    apiKey={activeProfileConfig?.apiKey}
+                    bedrockAuth={bedrockAuthFromConfig(activeProfileConfig)}
+                    value={activeProfile.modelId || defaultModelFor(activeProfile.provider)}
+                    onChange={onModelChange}
+                    disabled={running}
+                    compact
+                  />
+                ) : (
+                  <Select
+                    aria-label={t("assistant.model")}
+                    className="h-8 w-auto max-w-[180px] text-xs"
+                    value={activeProfile.modelId || defaultModelFor(activeProfile.provider)}
+                    disabled={running}
+                    onChange={(event) => onModelChange(event.target.value)}
+                  >
+                    {[
+                      ...new Set(
+                        [activeProfile.modelId, ...PROVIDER_MODELS[activeProfile.provider]].filter(
+                          Boolean,
+                        ),
                       ),
-                    ),
-                  ].map((modelId) => (
-                    <option key={modelId} value={modelId}>
-                      {modelId}
-                    </option>
-                  ))}
-                </Select>
+                    ].map((modelId) => (
+                      <option key={modelId} value={modelId}>
+                        {modelId}
+                      </option>
+                    ))}
+                  </Select>
+                )
               ) : null}
             </>
           ) : null}

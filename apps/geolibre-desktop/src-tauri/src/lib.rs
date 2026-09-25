@@ -447,6 +447,26 @@ pub fn run() {
         ])
         .setup(|app| {
             create_main_window(app)?;
+            // Nothing on Linux claims the OAuth callback scheme for us.
+            // `tauri-bundler` writes `Exec=` into the bundled .desktop with no
+            // field code, so `xdg-open org.geolibre.desktop:/oauth/callback?...`
+            // starts the app with an empty argv and the authorization code is
+            // dropped on the floor; an AppImage installs no .desktop at all.
+            // Registering at runtime writes a `%u`-qualified handler entry and
+            // makes it the scheme default, which covers deb, rpm, AppImage and
+            // the AUR/COPR repackages alike (#2667). Off the main thread: this
+            // shells out to update-desktop-database and xdg-mime, and window
+            // creation must not wait on them.
+            #[cfg(target_os = "linux")]
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = handle.deep_link().register_all() {
+                        eprintln!("Deep link: could not register URL schemes ({error}).");
+                    }
+                });
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -557,7 +577,7 @@ fn take_pending_project_paths(state: tauri::State<'_, PendingProjectPaths>) -> V
 /// `/...` or a Windows drive-letter `C:\...`, never a UNC `\\host\share`), free
 /// of `..` traversal, ending in a GeoLibre project extension — `.geolibre` or
 /// `.geolibre.json`. These are the canonical formats `saveProject` writes and
-/// `isGeoLibreProjectPath` recognizes in `tauri-io.ts`.
+/// `isGeoLibreProjectFileName` recognizes in `file-io/paths.ts`.
 ///
 /// Without this, the command was an arbitrary local-file reader: any webview JS
 /// or loaded plugin could `invoke("read_project_file", { path: "~/.ssh/id_rsa" })`
@@ -617,9 +637,9 @@ fn read_project_file(path: String) -> Result<String, String> {
 }
 
 /// Local vector file extensions the restore path may re-read (lowercased, no
-/// dot). Mirrors `VECTOR_FILE_DIALOG_EXTENSIONS` in `tauri-io.ts`; keep the two
+/// dot). Mirrors `VECTOR_FILE_DIALOG_EXTENSIONS` in `file-io/paths.ts`; keep the two
 /// in step.
-// SYNC: VECTOR_FILE_DIALOG_EXTENSIONS in src/lib/tauri-io.ts — grep "SYNC:" to
+// SYNC: VECTOR_FILE_DIALOG_EXTENSIONS in src/lib/file-io/paths.ts — grep "SYNC:" to
 // find the partner list and update both together.
 const RESTORABLE_VECTOR_EXTENSIONS: [&str; 17] = [
     "geojson",
@@ -648,7 +668,7 @@ const RESTORABLE_VECTOR_EXTENSIONS: [&str; 17] = [
 ///
 /// This is a Rust-side backstop mirroring the frontend guard
 /// (`isAbsoluteLocalPath` + `hasPathTraversal` + `isRestorableVectorPath` in
-/// `tauri-io.ts`). It narrows the attack surface of a compromised webview or
+/// `file-io/paths.ts`). It narrows the attack surface of a compromised webview or
 /// rogue plugin: arbitrary system files (`/etc/passwd`, SSH keys, most shell and
 /// app configs) are blocked. It does not make the command harmless — the
 /// allowlist still includes broad extensions like `json`, so a script that knows
@@ -924,6 +944,8 @@ const ALLOWED_ENV_VARS: &[&str] = &[
     "GOOGLE_GENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "OPENROUTER_MODEL",
     "OLLAMA_BASE_URL",
     "OLLAMA_MODEL",
     "OPENAI_COMPATIBLE_BASE_URL",

@@ -1,8 +1,10 @@
+import { Agent } from "@strands-agents/sdk";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
   availableProviders,
   configForProvider,
+  createModel,
   hasManagedAssistantProxy,
   openAiCompatibleHeaders,
   OPENAI_COMPATIBLE_STRIPPED_HEADERS,
@@ -10,8 +12,11 @@ import {
   readDeploymentAssistantEnv,
   readRuntimeEnv,
   resolveProviderConfig,
+  defaultModelFor,
+  type AssistantProfile,
   type RuntimeEnv,
 } from "../apps/geolibre-desktop/src/lib/assistant/provider";
+import { configForProfile } from "../apps/geolibre-desktop/src/lib/assistant/profiles";
 
 describe("build-time AI proxy", () => {
   it("does not configure a managed proxy unless its URL is explicitly set", () => {
@@ -370,13 +375,17 @@ describe("openAiCompatibleHeaders", () => {
 });
 
 describe("availableProviders", () => {
-  it("lists only providers with a configured key, in preference order", () => {
+  it("lists only configured providers in preference order", () => {
     assert.deepEqual(availableProviders({}), []);
     assert.deepEqual(availableProviders({ OPENAI_API_KEY: "o", GEMINI_API_KEY: "g" }), [
       "google",
       "openai",
     ]);
     assert.deepEqual(availableProviders({ ANTHROPIC_API_KEY: "a" }), ["anthropic"]);
+    assert.deepEqual(availableProviders({ OPENROUTER_API_KEY: "r", OPENAI_API_KEY: "o" }), [
+      "openai",
+      "openrouter",
+    ]);
   });
 });
 
@@ -408,5 +417,110 @@ describe("configForProvider", () => {
       configForProvider("anthropic", undefined, { ANTHROPIC_API_KEY: "a" })?.modelId,
       "claude-opus-5",
     );
+  });
+  it("resolves OpenRouter from a nonblank API key with its synchronous default model", () => {
+    assert.deepEqual(configForProvider("openrouter", undefined, { OPENROUTER_API_KEY: "key" }), {
+      provider: "openrouter",
+      apiKey: "key",
+      baseURL: "https://openrouter.ai/api/v1",
+      modelId: "openai/gpt-5.6-luna",
+    });
+    assert.equal(configForProvider("openrouter", undefined, { OPENROUTER_API_KEY: "  " }), null);
+  });
+
+  it("resolves the OpenRouter model override and gives explicit profile models precedence", () => {
+    assert.equal(
+      configForProvider("openrouter", undefined, {
+        OPENROUTER_API_KEY: "key",
+        OPENROUTER_MODEL: "provider/model",
+      })?.modelId,
+      "provider/model",
+    );
+    assert.equal(
+      configForProvider("openrouter", undefined, {
+        OPENROUTER_API_KEY: "key",
+        GEOLIBRE_ASSISTANT_MODEL: "global/model",
+        OPENROUTER_MODEL: "provider/model",
+      })?.modelId,
+      "global/model",
+    );
+    const profile: AssistantProfile = {
+      id: "openrouter-profile",
+      name: "OpenRouter",
+      provider: "openrouter",
+      modelId: "saved/model",
+      fieldValues: { OPENROUTER_API_KEY: "profile-key" },
+    };
+    const env = { OPENROUTER_MODEL: "provider/model" };
+    const profileWithEnvDefault: AssistantProfile = {
+      ...profile,
+      modelId: defaultModelFor("openrouter", env),
+    };
+    assert.equal(defaultModelFor("openrouter", env), "provider/model");
+    assert.equal(defaultModelFor("openrouter", {}), "openai/gpt-5.6-luna");
+    assert.equal(configForProfile(profileWithEnvDefault, env)?.modelId, "provider/model");
+    assert.equal(
+      configForProfile(profile, {
+        OPENROUTER_MODEL: "provider/model",
+        GEOLIBRE_ASSISTANT_MODEL: "global/model",
+      })?.modelId,
+      "saved/model",
+    );
+  });
+
+  it("sends a profile model to OpenRouter's Chat Completions endpoint", async () => {
+    const originalFetch = globalThis.fetch;
+    let requestUrl = "";
+    let requestHeaders: string[] = [];
+    let requestBody = "";
+    let authorizationHeader: string | null = null;
+    const chunks = [
+      {
+        id: "chatcmpl-test",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "openai/gpt-5.6-luna",
+        choices: [
+          { index: 0, delta: { role: "assistant", content: "Hello" }, finish_reason: null },
+        ],
+      },
+      {
+        id: "chatcmpl-test",
+        object: "chat.completion.chunk",
+        created: 0,
+        model: "openai/gpt-5.6-luna",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      },
+    ];
+    const body = `${chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`;
+
+    try {
+      globalThis.fetch = async (input, init) => {
+        const request = new Request(input, init);
+        requestUrl = request.url;
+        requestHeaders = [...request.headers.keys()].sort();
+        authorizationHeader = request.headers.get("authorization");
+        requestBody = await request.clone().text();
+        return new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      };
+      const config = configForProvider("openrouter", "vendor/selected-model", {
+        OPENROUTER_API_KEY: "profile-key",
+      });
+      assert.ok(config);
+      const model = await createModel(config);
+      for await (const _event of new Agent({ model }).stream("hello")) {
+        // Consume the real Strands/OpenAI stream to exercise the request path.
+      }
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.equal(requestUrl, "https://openrouter.ai/api/v1/chat/completions");
+    assert.deepEqual(requestHeaders, ["accept", "authorization", "content-type"]);
+    assert.equal(authorizationHeader, "Bearer profile-key");
+    assert.equal(JSON.parse(requestBody).model, "vendor/selected-model");
   });
 });

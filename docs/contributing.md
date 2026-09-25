@@ -23,8 +23,10 @@ before you invest time in a pull request.
 
 ## Prerequisites
 
-- **Node.js** 22 or newer
+- **Node.js** 22 or newer (`.nvmrc` pins the major version, so `nvm use`
+  picks it up)
 - **Rust** toolchain ([rustup](https://rustup.rs/)) for Tauri desktop builds
+  (`rust-toolchain.toml` selects the stable channel CI uses)
 - Linux only: `webkit2gtk` and `libayatana-appindicator` (see the
   [Tauri prerequisites](https://v2.tauri.app/start/prerequisites/))
 - **Python** 3.10 or newer for [pre-commit](https://pre-commit.com/) (the
@@ -71,7 +73,7 @@ packages/map            # MapLibre integration and layer sync
 packages/ui             # Tailwind + shadcn/ui primitives
 packages/plugins        # Plugin API and built-in plugins
 packages/processing     # Client-side algorithm registry
-workers/viewer          # Cloudflare viewer worker (geolibre-viewer-worker)
+workers/                # viewer, collab, collab-node, tiles and ai-proxy workers
 backend/geolibre_server # Optional FastAPI conversion sidecar (Python)
 docs/                   # This documentation site (MkDocs)
 ```
@@ -94,8 +96,9 @@ schema.
 4. Commit with a clear message. The history follows a
    [Conventional Commits](https://www.conventionalcommits.org/) style prefix,
    for example `feat:`, `fix:`, `docs:`, `refactor:`, or `chore:`.
-5. Push your branch and open a pull request against `main`. Describe what
-   changed and why, and link any related issue.
+5. Push your branch and open a pull request against `main`. The pull request
+   template asks what changed and why, how you tested it, and which issue it
+   relates to.
 
 Pull requests are reviewed before merging. Automated reviewers may leave inline
 comments; address them or explain why a suggestion does not apply.
@@ -108,27 +111,97 @@ Run the fast TypeScript unit tests while you work:
 npm run test:frontend
 ```
 
-Before opening a pull request, run the formatting hooks and the full local
-quality gate:
+For a type check without the Vite build, run `npm run typecheck:fast`
+(`tsc -b` over the app, no output written besides its incremental cache; it
+first builds the small `@geolibre/embed` package, whose `dist/` types the app
+imports).
+`npm run typecheck` is an alias for the full production build.
+
+Before opening a pull request, run the pre-commit hooks on the files you
+changed, then the local quality gate:
 
 ```bash
-pre-commit run --all-files
-npm run ci
+pre-commit run --files path/to/changed.ts path/to/other.tsx   # list each file you changed
+npm run ci:web   # frontend-only changes: no Rust or Python needed
+npm run ci       # the full gate that CI runs
 ```
 
-`npm run ci` runs the complete gate that mirrors continuous integration:
+Scope pre-commit to your files with `--files` rather than `--all-files`:
+`--all-files` reformats and re-checks every file in the repository, which is
+slow and can churn files you did not touch. The local `npm-build` hook still
+runs the full production build once per invocation; if you already built, add
+`SKIP=npm-build` in front of the command.
 
-| Step             | Command                 | Covers                            |
-| ---------------- | ----------------------- | --------------------------------- |
-| Build            | `npm run build`         | TypeScript compile and Vite build |
-| Frontend tests   | `npm run test:frontend` | Fast unit tests under `tests/`    |
-| Worker typecheck | `npm run test:worker`   | The viewer worker package         |
-| Backend tests    | `npm run test:backend`  | `pytest` for the Python sidecar   |
-| Rust check       | `npm run check:rust`    | `cargo check` for the Tauri shell |
+`npm run ci:web` is the quick gate for changes that only touch the web app and
+its packages: lint, the i18n catalog check, `typecheck:fast`, and the frontend
+unit tests. It needs only Node.
+
+`npm run ci` runs the complete gate that mirrors continuous integration, in this
+order:
+
+| Step               | Command                         | Covers                                                                                                              |
+| ------------------ | ------------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| Lint               | `npm run lint`                  | ESLint over `apps/`, `packages/`, `workers/` and `tests/`                                                           |
+| i18n catalog check | `npm run i18n:tools:check`      | The processing-tool strings in `en.json` match the tool registries (regenerate with `npm run i18n:tools`)           |
+| Build              | `npm run build`                 | TypeScript compile (`tsc -b`) and Vite build                                                                        |
+| Frontend tests     | `npm run test:frontend:coverage` | Unit tests under `tests/`, gated on a [coverage floor](maintenance.md#coverage-floors)                              |
+| Worker checks      | `npm run test:worker`           | Type checks all five workers (`viewer`, `collab`, `collab-node`, `tiles`, `ai-proxy`) and runs the `collab-node` tests |
+| Backend tests      | `npm run test:backend:coverage` | `pytest` for the Python sidecar, gated on a [coverage floor](maintenance.md#coverage-floors)                        |
+| Rust check         | `npm run check:rust`            | `cargo check` for the Tauri shell                                                                                   |
 
 You only need the toolchains for the areas you touched. A docs-only or
-frontend-only change does not require Rust or Python, though the full `npm run
-ci` gate does.
+frontend-only change does not require Rust or Python (use `npm run ci:web`),
+though the full `npm run ci` gate does. The backend step needs the sidecar's
+`test` extra (`pip install -e "backend/geolibre_server[test]"`); without it the
+vector, raster, SQL and ML tests skip themselves.
+
+### Component tests
+
+React panels are tested under the same `node --test` runner, against a
+[happy-dom](https://github.com/capricorn86/happy-dom) DOM with
+[Testing Library](https://testing-library.com/docs/react-testing-library/intro/),
+and with no map behind them. The `tests/component-*.test.ts` files are the
+examples to copy. A component test imports `tests/helpers/dom.ts` first and
+then loads the component with a dynamic `import()`:
+
+```ts
+import { fireEvent, render, screen, useAppStore } from "./helpers/dom";
+import { createElement } from "react";
+
+const { LayerPanel } = await import("../apps/geolibre-desktop/src/components/panels/LayerPanel");
+```
+
+The component has to be imported dynamically. The helper registers loader hooks
+that let Node load a component the way Vite does: CSS and `?url`/`?raw` imports
+become stubs, `virtual:` modules and `import.meta.env` get stand-ins, and `.tsx`
+compiles with the automatic JSX runtime. Hooks only apply to modules loaded after
+they are registered, and a static import is loaded before any module code runs.
+The helper also installs the DOM and initializes the app's own i18next with
+`en.json`, so queries use the real English strings. Its `render` wraps the
+element in the app's i18n, tooltip and direction providers.
+
+Set up state through the store (`useAppStore.setState(...)`) and assert on what
+the user sees or what lands in the store. After each test the helper unmounts
+everything and resets the app and desktop-settings stores, `localStorage`,
+`fetch` and any `stubLayout()`. Some other rules:
+
+- Pass `{ current: null }` for `mapControllerRef`. A panel that needs a live map
+  for a behaviour is a sign that logic belongs in a `lib/` module, where a plain
+  unit test can cover it.
+- Wrap store writes made after `render` in `act(...)` so React re-renders before
+  you assert.
+- `fetch` rejects by default. Serve a response with `mockFetch(...)`.
+- Call `stubLayout()` for virtualized lists such as the attribute table.
+  happy-dom does no layout, so without it every element is 0px tall and the list
+  renders no rows.
+- Assert on plain values (`textContent`, `.checked`, `.value`, store state), not
+  on DOM nodes. When an `assert.equal` on a node fails, Node formats the whole
+  happy-dom tree, which looks like a hang. Count query results with
+  `queryAll…().length` instead.
+
+These tests count towards the frontend [coverage floor](maintenance.md#coverage-floors)
+like any other test, so the first test for a large panel adds that panel to the
+report.
 
 ### End-to-end smoke tests
 
@@ -182,8 +255,12 @@ Both jobs upload their Playwright report as an artifact on failure.
     assets, MapLibre sprite atlases, the Whitebox tool-catalog snapshot, which
     grows ~64% under oxfmt). The intentionally malformed
     `e2e/fixtures/malformed.geojson` fixture is also excluded.
-  - **ESLint** enforces the React Hooks rules on TS/JS; a `npm run build`
-    typecheck runs too.
+  - **ESLint** fails on React Hooks rule violations and warns on floating
+    promises, `any`, missing Hook dependencies, and physical Tailwind
+    direction classes (`ml-*`, `left-*`, `text-right`; see
+    [Internationalization](i18n.md#right-to-left-languages)). Warnings are
+    held by a [ratchet](maintenance.md#lint-warning-ratchet), so a change
+    that adds one fails lint. A `npm run build` typecheck runs too.
 - **Notebook outputs are stripped repo-wide on every commit.** The
   `strip-notebook-outputs` hook runs `nbstripout` over *every tracked*
   `.ipynb`, not just the notebooks in your commit, so an output that was

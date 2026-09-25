@@ -22,8 +22,11 @@ implementation or storage engine. The reference implementation lives in
   public/unlisted project versions and may use `ETag`/conditional requests.
   Responses containing private, organization, or group-protected content must
   use `Cache-Control: private, no-store`, including metadata listings.
-- CORS deployments must allow `Authorization` and `Content-Type` from the
-  GeoLibre web origin. Native desktop requests do not depend on CORS.
+- Cross-origin web deployments must allow `Authorization` and `Content-Type`
+  from the GeoLibre web origin. On self-hosted Tauri installations using browser
+  fetch, allow `tauri://localhost` and/or `http://tauri.localhost` explicitly.
+  The shipped desktop HTTPS share origin uses native HTTP for authenticated
+  requests; that transport does not depend on CORS.
 
 ## What the reference server leaves to the operator
 
@@ -167,8 +170,9 @@ Revokes the presented Bearer token. Response: `204`.
 
 ### `GET /api/users/me`
 
-Returns the account, effective project scopes, and OAuth session ID. `sessionId`
-is `null` for personal tokens.
+Returns the account, effective credential scopes, and OAuth session ID. `sessionId`
+is `null` for personal tokens. A management grant reports only
+`["manage:sessions"]`, not the project's scopes.
 
 ```json
 {
@@ -182,6 +186,65 @@ An identity provider may create accounts without a username. Project creation
 for such an account must return `400` with an error containing the stable,
 case-insensitive sentinel text `username required`. Existing clients recognize
 that phrase and direct the user to account settings.
+
+### Session and personal-token management
+
+These routes require a separate OAuth Bearer grant whose **only** scope is
+`manage:sessions`. A project OAuth grant, even for the same account, and every
+personal API token receive `403 insufficient_scope`. The client first resolves
+the account ID and project `sessionId` using its project credential, then
+requests fresh management consent and compares the management account ID
+before listing anything. Management credentials must not be persisted or used
+for project/gallery calls.
+
+`GET /api/auth/sessions?limit=50&offset=0&currentSessionId=<project-session-id>`
+returns `{"sessions": [<session>], "limit": 50, "offset": 0, "total": 1}`.
+`limit` is 1–100; `offset` is nonnegative. If supplied, `currentSessionId`
+must name an active project session owned by the management account, otherwise
+the response is `404`. The server marks exactly that entry `current: true`.
+Only active, unexpired project OAuth sessions and personal API tokens appear;
+short-lived management grants never appear. Rows sort by creation time newest
+first, then ID for ties. Each row contains a public UUID, not a token:
+
+```json
+{
+  "id": "uuid",
+  "kind": "oauth",
+  "clientId": "geolibre-desktop",
+  "label": "GeoLibre Desktop",
+  "scopes": ["read:projects", "write:projects", "share:public"],
+  "createdAt": "2026-08-03T12:00:00Z",
+  "lastUsedAt": null,
+  "expiresAt": "2026-09-02T12:00:00Z",
+  "current": true,
+  "legacy": false
+}
+```
+
+Personal tokens use `kind: "personal-token"`, `clientId: null`,
+`current: false`, and may have `expiresAt: null`. Old tokens without a policy
+are backfilled on listing, marked `legacy: true`, and remain valid until
+revoked. Management responses use `Cache-Control: private, no-store`.
+
+`DELETE /api/auth/sessions/{id}` returns `204` for an owned project OAuth
+family or personal token, including one already revoked. Management grants are
+not addressable through this endpoint; unknown, foreign, and management-only IDs
+return the same `404`. Revocation invalidates the family, not just one access
+token.
+If the ID is the current project session, the client must immediately clear
+its local project credential and protected Gallery/remote-edit state; it must
+not keep a stale session UI. A pasted personal token remains a separate
+credential and is not silently replaced by the OAuth grant.
+
+`POST /api/auth/sessions/revoke-others` accepts
+`{"currentSessionId":"<project-session-id>"}` and returns `204`. It atomically
+revokes every other OAuth family and **every** personal token for this account,
+while keeping both the owned active project session named in the request and
+the calling management grant. Missing, foreign, expired, revoked, or
+management-only IDs are `404` without partial revocation. Clients should
+confirm this destructive action and warn that scripts and CI using personal
+tokens will stop working. Refresh rotation and bulk revocation serialize on
+the session rows on PostgreSQL.
 
 ## Organizations
 
@@ -559,7 +622,8 @@ port, must match the issuer authority.
 issuer with path `/services/projects`, the route is
 `/.well-known/oauth-authorization-server/services/projects`. The document
 advertises the authorization, token, and revocation endpoints; authorization
-code and refresh grants; `S256`; and the three project scopes.
+code and refresh grants; `S256`; the three project scopes; and
+`manage:sessions` (OAuth-only).
 
 ### Authorization and consent
 
@@ -579,10 +643,19 @@ browser-binding cookie, CSRF value, same-origin `Origin` or `Referer`, and
 account credentials. Approval returns `303` to the exact callback with a
 single-use code, `state`, and `iss`; cancellation returns `access_denied`.
 Authorization codes expire after 60 seconds by default.
+Production HTTPS uses a host-only `Secure` browser-binding cookie; permitted
+loopback HTTP development uses a host-only non-`Secure` cookie so Safari can
+submit the consent form.
 
 Web redirects must be absolute HTTPS URLs ending in `/oauth-callback.html`.
 Explicit-port loopback HTTP is allowed for development. Desktop redirects must
-be exactly `org.geolibre.desktop:/oauth/callback`.
+be exactly `org.geolibre.desktop:/oauth/callback`. The installed Tauri desktop
+app opens consent in the system browser and receives that URI through the OS
+protocol handler (on macOS, Windows, and Linux), not an inbound HTTP listener.
+It accepts a callback only for a live, matching state and issuer. A callback
+that cold-launches an app with no pending verifier cannot complete sign-in:
+the user must restart consent. No authorization code or token belongs in a
+diagnostic log or a persisted project.
 
 ### Token exchange and rotation
 
@@ -606,6 +679,16 @@ Success returns:
 }
 ```
 
+Request `manage:sessions` **alone** for a fresh step-up consent. Combining it
+with project scopes is `invalid_scope`. Its success response has
+`"scope":"manage:sessions"` and `"expires_in":300` (or less if the server
+enforces a shorter access lifetime), but **no `refresh_token`**. The server
+never creates a refresh row for this grant, rejects refresh attempts, and
+caps its access token and family at five minutes. A client must hold the
+management token only in memory and discard it when session management closes,
+the project session changes, or the grant expires. A `401` on a management
+request requires a new consent; it must not sign the project session out.
+
 Access tokens expire after 600 seconds by default and never outlive their
 family. Refresh tokens are single-use and rotate on every use. Reusing a
 consumed refresh token revokes the entire family, including tokens minted by
@@ -627,9 +710,11 @@ OAuth failures use `invalid_request`, `invalid_client`, `invalid_grant`,
 and revocation responses are `no-store`. Raw codes and tokens are returned once;
 the database stores only SHA-256 digests.
 
-OAuth access tokens use the same project scope matrix as personal tokens.
-`admin:org` and `manage:sessions` are reserved for later stacks and are rejected
-by this server.
+Project OAuth access tokens use the same project scope matrix as personal
+tokens. `manage:sessions` authorizes only the session-management routes
+documented above. It is exclusive to OAuth consent, never available to
+personal tokens; it grants no project read or write access. `admin:org`
+remains reserved and is rejected.
 
 ## Compatibility
 

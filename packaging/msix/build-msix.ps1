@@ -161,6 +161,11 @@ $manifest = @"
             </uap:SupportedFileTypes>
           </uap:FileTypeAssociation>
         </uap:Extension>
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="org.geolibre.desktop">
+            <uap:DisplayName>GeoLibre Desktop</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
       </Extensions>
     </Application>
   </Applications>

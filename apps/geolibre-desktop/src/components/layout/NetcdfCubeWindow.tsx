@@ -3,7 +3,15 @@ import type { MapEngine } from "@geolibre/map";
 import { gridPixelAt, type LocalNetcdfGrid, type LocalNetcdfWindow } from "@geolibre/plugins";
 import { Button, ColorRampSelect, Label } from "@geolibre/ui";
 import { Boxes, GripVertical, Settings2, X } from "lucide-react";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useColormapRamps } from "../../hooks/useColormapRamps";
 import { bandLabel, defaultRgbBands, MAX_AXIS_OPTIONS } from "../../lib/netcdf-band-axis";
@@ -32,7 +40,6 @@ import {
   rampRgb,
   warmNetcdfColormap,
 } from "../../lib/netcdf-image-symbology";
-import { NetcdfCubeView } from "../panels/NetcdfCubeView";
 
 /** Panel geometry (px). */
 const PANEL_MIN_W = 360;
@@ -60,6 +67,32 @@ interface NetcdfCubeWindowProps {
   mapControllerRef: React.RefObject<MapEngine | null>;
 }
 
+type NetcdfCubeViewComponent = typeof import("../panels/NetcdfCubeView").NetcdfCubeView;
+
+/**
+ * Builds a lazy NetcdfCubeView. The view draws with three.js (~0.5 MB), and this
+ * window is mounted for the whole session but shows a cube only on request, so
+ * the view and three.js load with the first cube rather than at startup.
+ *
+ * React caches a lazy component's result, including a failed load, so a retry
+ * needs a fresh one from this factory.
+ *
+ * @param onError - Called when the chunk fails to load (e.g. offline).
+ * @returns The lazy component. After a failed load it renders nothing, so the
+ *   failure does not throw during render and unmount the shell.
+ */
+function lazyNetcdfCubeView(onError: (error: unknown) => void) {
+  return lazy(() =>
+    import("../panels/NetcdfCubeView")
+      .then((module) => ({ default: module.NetcdfCubeView }))
+      .catch((error: unknown) => {
+        console.error("Failed to load NetcdfCubeView", error);
+        onError(error);
+        return { default: (() => null) as unknown as NetcdfCubeViewComponent };
+      }),
+  );
+}
+
 /**
  * The 3-D image cube, in a movable window over the map.
  *
@@ -78,8 +111,10 @@ interface NetcdfCubeWindowProps {
  */
 export function NetcdfCubeWindow({ mapControllerRef }: NetcdfCubeWindowProps) {
   const { t } = useTranslation();
-  const rampOptions = useColormapRamps();
   const state = useSyncExternalStore(subscribeNetcdfCube, getNetcdfCubeState, getNetcdfCubeState);
+  // The window stays mounted with no cube, so sample the ramps only once one is
+  // shown (the same condition the render below returns null on).
+  const rampOptions = useColormapRamps(Boolean(state.layerId) && state.readToken !== 0);
   // Mounted for both phases, so a trip to the settings dialog and back does not
   // throw away the decoded cube; the modal simply sits over it. `readToken` is
   // what says a *new* read was asked for.
@@ -90,6 +125,15 @@ export function NetcdfCubeWindow({ mapControllerRef }: NetcdfCubeWindowProps) {
   const [cube, setCube] = useState<NetcdfCube | null>(null);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The lazily loaded cube view, and whether its chunk failed to load.
+  const [viewLoadFailed, setViewLoadFailed] = useState(false);
+  const [NetcdfCubeView, setNetcdfCubeView] = useState(() =>
+    lazyNetcdfCubeView(() => setViewLoadFailed(true)),
+  );
+  const retryCubeView = useCallback(() => {
+    setViewLoadFailed(false);
+    setNetcdfCubeView(() => lazyNetcdfCubeView(() => setViewLoadFailed(true)));
+  }, []);
   const [zScale, setZScale] = useState(DEFAULT_Z_SCALE);
   // Bands kept, counted up from the first: the cut plane, as a fraction so it
   // survives a re-read that changes the band count.
@@ -305,14 +349,25 @@ export function NetcdfCubeWindow({ mapControllerRef }: NetcdfCubeWindowProps) {
 
       <div className="relative min-h-0 flex-1 bg-muted/30">
         {cube ? (
-          <NetcdfCubeView
-            cube={cube}
-            colors={colors}
-            clim={clim}
-            zScale={zScale}
-            sliceBands={sliceBands}
-            showRgb={showRgb}
-          />
+          <Suspense
+            fallback={
+              <div
+                role="status"
+                className="absolute inset-0 flex items-center justify-center text-sm text-muted-foreground"
+              >
+                {t("netcdfCube.viewLoading")}
+              </div>
+            }
+          >
+            <NetcdfCubeView
+              cube={cube}
+              colors={colors}
+              clim={clim}
+              zScale={zScale}
+              sliceBands={sliceBands}
+              showRgb={showRgb}
+            />
+          </Suspense>
         ) : null}
         {reading ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-background/70 text-xs">
@@ -336,6 +391,14 @@ export function NetcdfCubeWindow({ mapControllerRef }: NetcdfCubeWindowProps) {
         {error ? (
           <div className="absolute inset-0 flex items-center justify-center p-4">
             <p className="text-center text-xs text-destructive">{error}</p>
+          </div>
+        ) : null}
+        {cube && viewLoadFailed ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4">
+            <p className="text-center text-xs text-destructive">{t("netcdfCube.viewLoadFailed")}</p>
+            <Button type="button" size="sm" variant="outline" onClick={retryCubeView}>
+              {t("netcdfCube.retry")}
+            </Button>
           </div>
         ) : null}
       </div>

@@ -29,6 +29,7 @@ providers in **Settings → AI Providers**:
 | Google Gemini | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | `gemini-3.6-flash` |
 | Anthropic | `ANTHROPIC_API_KEY` | `claude-opus-5` |
 | OpenAI | `OPENAI_API_KEY` | Select from the current GPT models |
+| **OpenRouter** | `OPENROUTER_API_KEY` (+ optional `OPENROUTER_MODEL`) | `openai/gpt-5.6-luna` |
 | **Ollama** (local) | `OLLAMA_BASE_URL` (e.g. `http://localhost:11434`) | `gemma4` |
 | **Amazon Bedrock** | `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_REGION`, optional `AWS_SESSION_TOKEN`) | `global.anthropic.claude-opus-5` |
 | **Custom** (OpenAI-compatible) | `OPENAI_COMPATIBLE_BASE_URL` (+ optional `OPENAI_COMPATIBLE_API_KEY`) and `OPENAI_COMPATIBLE_MODEL` | — |
@@ -39,8 +40,11 @@ providers in **Settings → AI Providers**:
 - **Bedrock** calls AWS from the browser using your credentials (and the model
   id is an inference-profile id such as `global.anthropic.claude-sonnet-4-6`; set
   `BEDROCK_MODEL` to choose another).
-- **Custom** covers any OpenAI-compatible endpoint — LiteLLM, vLLM, OpenRouter,
-  Groq, Together, a local server, etc. — via its chat-completions API.
+- **OpenRouter** calls its Chat Completions API from your browser. Its model picker
+  fetches the public catalog without sending your key; search by model name or id,
+  or enter an unlisted `provider/model` id. Set `OPENROUTER_MODEL` to choose a
+  different default.
+- **Custom** covers any OpenAI-compatible endpoint — LiteLLM, vLLM, Groq, Together, a local server, etc. — via its chat-completions API.
 
 Hosted keys (and AWS credentials) are used **directly from your browser** to call
 the provider; they are never sent to GeoLibre's servers. Saving the setting
@@ -158,7 +162,7 @@ Optional variables:
 
 | Variable | Purpose |
 | --- | --- |
-| `GEOLIBRE_ASSISTANT_PROVIDER` | Force a provider (`google` / `anthropic` / `openai`) when several keys are set. |
+| `GEOLIBRE_ASSISTANT_PROVIDER` | Force a provider (`google` / `anthropic` / `openai` / `openrouter`) when several keys are set. |
 | `GEOLIBRE_ASSISTANT_MODEL` | Pin a specific model id, overriding the default and the picker. |
 
 When more than one provider key is configured, a **provider** dropdown appears in
@@ -187,6 +191,7 @@ the UI:
 | Google Gemini | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_API_KEY` |
 | Anthropic | `ANTHROPIC_API_KEY` |
 | OpenAI | `OPENAI_API_KEY` |
+| OpenRouter | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` |
 | Ollama | `OLLAMA_BASE_URL`, `OLLAMA_MODEL` |
 | Custom (OpenAI-compatible) | `OPENAI_COMPATIBLE_BASE_URL`, `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_COMPATIBLE_MODEL` |
 | Web search | `TAVILY_API_KEY` |

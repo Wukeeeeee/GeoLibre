@@ -282,6 +282,56 @@ def test_revoke_cannot_race_rotation_into_a_valid_token(postgres_app):
         client.close()
 
 
+def test_revoke_others_serializes_with_refresh(postgres_app):
+    from helpers import auth
+
+    app = postgres_app
+    with TestClient(app, base_url="https://share.example") as initial:
+        current = sign_in(initial)
+        kept = initial.get("/api/users/me", headers=auth(current["access_token"]))
+        current_id = kept.json()["sessionId"]
+        other = sign_in(initial)
+        manager = sign_in(initial, scope="manage:sessions")
+        refresher, revoker = _two_clients(app)
+        try:
+            results, errors = _run_concurrently(
+                [
+                    lambda: refresh(refresher, other["refresh_token"]),
+                    lambda: revoker.post(
+                        "/api/auth/sessions/revoke-others",
+                        headers=auth(manager["access_token"]),
+                        json={"currentSessionId": current_id},
+                    ),
+                ]
+            )
+            assert not errors, errors
+            assert results[1].status_code == 204, results[1].text
+            assert (
+                initial.get("/api/users/me", headers=auth(current["access_token"])).status_code
+                == 200
+            )
+            assert (
+                initial.get("/api/users/me", headers=auth(manager["access_token"])).status_code
+                == 200
+            )
+            assert (
+                initial.get("/api/users/me", headers=auth(other["access_token"])).status_code == 401
+            )
+            assert refresh(initial, other["refresh_token"]).status_code == 400
+            if results[0].status_code == 200:
+                rotated = results[0].json()
+                assert (
+                    initial.get("/api/users/me", headers=auth(rotated["access_token"])).status_code
+                    == 401
+                )
+                assert refresh(initial, rotated["refresh_token"]).status_code == 400
+            else:
+                assert results[0].status_code == 400
+        finally:
+            refresher.close()
+            revoker.close()
+
+
 def test_account_deletion_cascades_oauth_rows(postgres_app):
     app = postgres_app
     client = TestClient(app, base_url="https://share.example")

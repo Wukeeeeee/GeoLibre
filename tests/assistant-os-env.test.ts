@@ -33,6 +33,7 @@ describe("OS_ENV_VAR_NAMES", () => {
     const extras = new Set([
       "GEOLIBRE_ASSISTANT_PROVIDER",
       "GEOLIBRE_ASSISTANT_MODEL",
+      "OPENROUTER_MODEL",
       "TAVILY_API_KEY",
       "JEV_API_KEY",
     ]);
@@ -52,6 +53,8 @@ describe("OS_ENV_VAR_NAMES", () => {
       "GOOGLE_GENAI_API_KEY",
       "ANTHROPIC_API_KEY",
       "OPENAI_API_KEY",
+      "OPENROUTER_API_KEY",
+      "OPENROUTER_MODEL",
       "OLLAMA_BASE_URL",
       "OLLAMA_MODEL",
       "OPENAI_COMPATIBLE_BASE_URL",
@@ -109,6 +112,19 @@ describe("OS env feeds provider resolution", () => {
     const merged = { ...osEnv };
     assert.deepEqual(availableProviders(merged), ["openai"]);
     assert.equal(configForProvider("openai", undefined, merged)?.apiKey, "os-key");
+  });
+  it("configures OpenRouter from an OS key and its OS model override", () => {
+    const merged = {
+      OPENROUTER_API_KEY: "os-key",
+      OPENROUTER_MODEL: "vendor/os-model",
+    };
+    assert.deepEqual(availableProviders(merged), ["openrouter"]);
+    assert.deepEqual(configForProvider("openrouter", undefined, merged), {
+      provider: "openrouter",
+      apiKey: "os-key",
+      baseURL: "https://openrouter.ai/api/v1",
+      modelId: "vendor/os-model",
+    });
   });
 
   it("lets a project key override the OS key on the same name", () => {

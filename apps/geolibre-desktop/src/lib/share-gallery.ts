@@ -4,8 +4,8 @@
 //
 // `fetchSharedProjects` reads the public listing (`GET /api/projects`, no
 // token) with `limit` + `offset` pagination. `fetchMyProjects` authenticates
-// with a personal API token to also return the signed-in user's `unlisted` and
-// `private` projects.
+// with an OAuth access token or personal API token to also return the signed-in
+// user's `unlisted` and `private` projects.
 
 import { getShareFetch } from "./share-fetch";
 import { resolveShareBaseUrl } from "./share-geolibre";
@@ -375,14 +375,9 @@ export function projectOpenToken(
 }
 
 /**
- * Wrap a fetch so requests to the share host carry the personal API token. The
- * `Authorization` header is attached only for same-origin-as-`base` URLs so the
- * token is never leaked to a third-party host (e.g. an external tile server
- * referenced by a project).
- *
- * @param baseFetch - The underlying fetch to wrap; defaults to the global
- *   `fetch`. Tests inject a stub here so production and test exercise the same
- *   same-origin gating logic.
+ * Attach the credential only to the share origin. Authenticated requests may
+ * not follow redirects: browser fetch enforces redirect:"error", and the
+ * native share transport translates that policy to maxRedirections:0.
  */
 export function shareAuthorizedFetch(
   token: string,
@@ -397,16 +392,26 @@ export function shareAuthorizedFetch(
   }
   return ((input: RequestInfo | URL, init: RequestInit = {}) => {
     const href = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    let sameHost = false;
+    let sameOrigin = false;
     try {
-      sameHost = baseOrigin != null && new URL(href).origin === baseOrigin;
+      sameOrigin = baseOrigin != null && new URL(href).origin === baseOrigin;
     } catch {
-      sameHost = false;
+      sameOrigin = false;
     }
-    if (!sameHost) return baseFetch(input, init);
-    const headers = new Headers(init.headers);
+    if (!sameOrigin) {
+      // A caller may pass a Request initialized for an issuer URL but resolved
+      // to a third-party project URL. Never forward its Authorization header.
+      const headers = new Headers(
+        init.headers ?? (input instanceof Request ? input.headers : undefined),
+      );
+      if (!headers.has("Authorization")) return baseFetch(input, init);
+      headers.delete("Authorization");
+      return baseFetch(input, { ...init, headers });
+    }
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    new Headers(init.headers).forEach((value, key) => headers.set(key, value));
     headers.set("Authorization", `Bearer ${token}`);
-    return baseFetch(input, { ...init, headers });
+    return baseFetch(input, { ...init, headers, redirect: "error" });
   }) as typeof fetch;
 }
 

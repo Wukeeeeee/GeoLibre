@@ -250,6 +250,8 @@ def test_pending_authorizations_are_capped(oauth_client):
 def test_browser_cookie_survives_parallel_web_and_desktop_flows(oauth_client):
     web, web_verifier, web_interaction, web_csrf = start_authorize(oauth_client)
     assert web.status_code == 200
+    assert "__Host-geolibre_oauth_browser=" in web.headers["set-cookie"]
+    assert "secure" in web.headers["set-cookie"].lower()
     original_cookie = oauth_client.cookies.get("__Host-geolibre_oauth_browser")
 
     desktop, desktop_verifier, desktop_interaction, desktop_csrf = start_authorize(
@@ -276,6 +278,38 @@ def test_browser_cookie_survives_parallel_web_and_desktop_flows(oauth_client):
         ).status_code
         == 200
     )
+
+
+def test_loopback_desktop_consent_works_without_https_only_cookie(tmp_path, monkeypatch, clock):
+    from conftest import OAUTH_CLIENTS
+
+    issuer = "http://127.0.0.1:8768"
+    monkeypatch.setenv("GEOLIBRE_OAUTH_CLIENTS", json.dumps(OAUTH_CLIENTS))
+    app = create_app(
+        f"sqlite:///{tmp_path / 'loopback.db'}",
+        public_url=issuer,
+        storage=FileStorage(str(tmp_path / "objects")),
+        clock=clock.now,
+    )
+    with TestClient(app, base_url=issuer) as client:
+        response, verifier, interaction, csrf = start_authorize(
+            client, client_id="geolibre-desktop"
+        )
+        assert response.status_code == 200
+        assert "geolibre_oauth_browser=" in response.headers["set-cookie"]
+        assert "__Host-" not in response.headers["set-cookie"]
+        assert "secure" not in response.headers["set-cookie"].lower()
+        approved = approve(client, interaction, csrf, origin=issuer)
+        assert approved.status_code == 303
+        assert (
+            exchange_code(
+                client,
+                redirect_params(approved)["code"],
+                client_id="geolibre-desktop",
+                verifier=verifier,
+            ).status_code
+            == 200
+        )
 
 
 def test_bad_host_is_rejected(oauth_client):

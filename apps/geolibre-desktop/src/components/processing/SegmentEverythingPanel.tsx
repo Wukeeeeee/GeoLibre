@@ -31,7 +31,6 @@ import {
 import { useTranslation } from "react-i18next";
 import { clamp } from "../../lib/clamp";
 import { openLocalDataFileWithFallback } from "../../lib/tauri-io";
-import { reprojectFeatureCollectionToWgs84 } from "../../lib/duckdb-vector-loader";
 import {
   fetchSegmentModel,
   SLIMSAM_DECODER_URL,
@@ -250,7 +249,14 @@ export function SegmentEverythingPanel({
         return;
       }
       const tagged = masksToFeatureCollection(masks, raster);
+      const { reprojectFeatureCollectionToWgs84 } = await import("../../lib/duckdb-vector-loader");
+      // Skip the reprojection (it may open a DuckDB connection) if the panel
+      // closed while the loader chunk was fetched.
+      if (controller.signal.aborted) return;
       const fc = await reprojectFeatureCollectionToWgs84(tagged);
+      // The panel may have been closed while the loader chunk or the
+      // reprojection was pending.
+      if (controller.signal.aborted) return;
       const layerId = addGeoJsonLayer(t("segmentEverything.layerName"), fc);
       const layer = useAppStore.getState().layers.find((item) => item.id === layerId);
       if (layer) mapControllerRef.current?.fitLayer(layer);

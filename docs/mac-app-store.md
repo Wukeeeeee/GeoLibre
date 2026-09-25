@@ -87,6 +87,29 @@ If a future feature genuinely needs to accept an inbound connection, re-adding
 the entitlement is not sufficient on its own: describe the functionality in **App
 Review Information** before submitting, or the automated check rejects it again.
 
+### Share.GeoLibre sign-in uses a custom URI, not a listener
+
+The MAS desktop build retains Share.GeoLibre project sign-in and Settings →
+Environment → session management. Its PKCE consent opens the system browser;
+the exact registered callback `org.geolibre.desktop:/oauth/callback` returns
+through the installed app's OS URI handler. No socket binds, so this does
+**not** require `com.apple.security.network.server`. The app starts the
+callback listener before accepting a sign-in; a callback that launches a cold
+process has no pending verifier and shows a restart-sign-in message rather than
+exchanging its code. A late callback from a timed-out or cancelled consent is
+ignored so it cannot interrupt an immediate retry. A fresh management consent
+lasts at most five minutes,
+has no refresh token, and stays in memory only. The desktop project's refresh
+credential is also memory-only and is lost when the app quits. Pasted personal
+API tokens remain a separate optional fallback.
+
+For the shipped `https://share.geolibre.app` origin, authenticated desktop
+requests use native HTTP with redirects disabled so a redirected Bearer header
+cannot cross hosts. Self-hosted share origins use browser fetch and must allow
+the Tauri webview origin in CORS; the MAS sandbox's `network.client`
+entitlement permits those outgoing connections. Neither path adds an inbound
+listener or changes the `network.server` ban.
+
 Everything client-side is unchanged and fully functional: MapLibre/deck.gl
 rendering, Add Data for local and remote files, DuckDB-WASM vector reading,
 Whitebox WASM tools, Turf/Pyodide vector tools, browser-engine conversions,
@@ -155,6 +178,18 @@ The sandboxed app can be smoke-tested by running the built
 `GeoLibre Desktop.app` directly; `codesign -d --entitlements - --xml` on the
 bundle should show `com.apple.security.app-sandbox`, and must **not** show
 `com.apple.security.network.server`.
+
+For an OAuth release smoke, **install** the signed `.app` before testing the
+URI association. Configure the issuer with the `geolibre-desktop` client and
+the exact callback above, then use Settings → Environment to sign in via the
+system browser. Verify a matching callback completes only while consent is
+pending, a cold callback asks for a restart, a second management consent
+lists sessions, and revoking the current project session signs the app out.
+Repeat the URI roundtrip with installed Windows/MSIX and Linux packages on
+their respective OS runners; compiling a package on macOS does not verify
+their protocol associations. Check packaged logs for redacted callback query
+parameters, and check the app signature again for the missing
+`com.apple.security.network.server` entitlement.
 
 ## CI: the `mas-store.yml` workflow
 

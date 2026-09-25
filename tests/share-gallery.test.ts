@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, it } from "node:test";
 import {
   fetchMyGroups,
@@ -531,23 +533,77 @@ describe("gallery with no configured share host", () => {
 });
 
 describe("shareAuthorizedFetch", () => {
-  it("attaches the token only for the share host, never third parties", async () => {
-    const seen: { url: string; auth: string | null }[] = [];
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
-      const url = typeof input === "string" ? input : String(input);
-      seen.push({ url, auth: new Headers(init.headers).get("Authorization") });
-      return { ok: true, status: 200 } as Response;
-    }) as unknown as typeof fetch;
+  it("adds a credential only for the share origin and rejects a redirect before reaching its target", async () => {
+    const sourceRequests: string[] = [];
+    const targetRequests: string[] = [];
+    const target = createServer((req, res) => {
+      targetRequests.push(req.headers.authorization ?? "");
+      res.end("target");
+    });
+    const source = createServer((req, res) => {
+      sourceRequests.push(req.headers.authorization ?? "");
+      res.writeHead(302, {
+        Location: `http://127.0.0.1:${(target.address() as AddressInfo).port}/target`,
+      });
+      res.end();
+    });
+    await Promise.all([
+      new Promise<void>((resolve) => target.listen(0, "127.0.0.1", resolve)),
+      new Promise<void>((resolve) => source.listen(0, "127.0.0.1", resolve)),
+    ]);
     try {
-      const authed = shareAuthorizedFetch("glb_tok", BASE);
-      await authed(`${BASE}/giswqs/secret.geolibre.json`);
-      await authed("https://tiles.example.com/data.json");
-      assert.equal(seen[0].auth, "Bearer glb_tok");
-      assert.equal(seen[1].auth, null);
+      const base = `http://127.0.0.1:${(source.address() as AddressInfo).port}`;
+      const authed = shareAuthorizedFetch("glb_tok", base);
+      await assert.rejects(authed(`${base}/share`), TypeError);
+      assert.deepEqual(targetRequests, []);
+      assert.deepEqual(sourceRequests, ["Bearer glb_tok"]);
+
+      // Unauthenticated requests retain the browser's ordinary redirect policy.
+      const publicResponse = await fetch(`${base}/share`);
+      assert.equal(await publicResponse.text(), "target");
+      assert.deepEqual(targetRequests, [""]);
+      assert.deepEqual(sourceRequests, ["Bearer glb_tok", ""]);
     } finally {
-      globalThis.fetch = original;
+      await Promise.all([
+        new Promise<void>((resolve, reject) =>
+          target.close((error) => (error ? reject(error) : resolve())),
+        ),
+        new Promise<void>((resolve, reject) =>
+          source.close((error) => (error ? reject(error) : resolve())),
+        ),
+      ]);
     }
+  });
+
+  it("preserves Request headers on the share origin and leaves third-party requests uncredentialed", async () => {
+    const seen: { url: string; headers: Headers; redirect: RequestRedirect | undefined }[] = [];
+    const baseFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push({
+        url: input instanceof Request ? input.url : String(input),
+        headers: new Headers(
+          init?.headers ?? (input instanceof Request ? input.headers : undefined),
+        ),
+        redirect: init?.redirect,
+      });
+      return new Response("ok");
+    }) as typeof fetch;
+    const authed = shareAuthorizedFetch("glb_tok", BASE, baseFetch);
+    await authed(new Request(`${BASE}/private`, { headers: { "X-Project": "one" } }));
+    await authed(new URL("https://tiles.example.com/data.json"));
+    await authed(new Request("https://tiles.example.com/elsewhere"));
+    await authed(
+      new Request("https://tiles.example.com/secret", {
+        headers: { Authorization: "Bearer issuer-secret", "X-Project": "two" },
+      }),
+    );
+    assert.equal(seen[0].headers.get("X-Project"), "one");
+    assert.equal(seen[0].headers.get("Authorization"), "Bearer glb_tok");
+    assert.equal(seen[0].redirect, "error");
+    assert.equal(seen[1].headers.get("Authorization"), null);
+    assert.equal(seen[1].redirect, undefined);
+    assert.equal(seen[2].headers.get("Authorization"), null);
+    assert.equal(seen[3].headers.get("Authorization"), null);
+    assert.equal(seen[3].headers.get("X-Project"), "two");
   });
 });
 

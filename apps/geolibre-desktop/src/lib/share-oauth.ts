@@ -1,33 +1,23 @@
-// Web sign-in for the share server: OAuth 2.0 Authorization Code with S256
-// PKCE against the reference server's consent endpoint (Stack 3 of the OAuth
-// rollout; see docs/server-api.md "OAuth 2.0 sign-in").
-//
-// Credential model:
-// - The refresh token lives in sessionStorage, scoped by issuer. Session
-//   storage (not local) so closing the tab drops the grant instead of leaving a
-//   month-long credential in a shared browser.
-// - The access token lives only in this module's memory; every consumer asks
-//   {@link getShareAccessToken} right before an authenticated request.
-// - The desktop (Tauri) and Jupyter-embed builds never run this flow: they keep
-//   the pasted personal-API-token path (Stack 4 will add the desktop browser
-//   flow), and {@link supportsShareOAuth} reports false there.
-//
-// Security invariants (each enforced where it is cheap to test):
-// - The popup is reserved synchronously inside the click handler, before any
-//   await, so Safari's popup blocker does not kill the window.
-// - The callback message is accepted only from the popup itself, at the app's
-//   own origin, with the exact `state` this flow minted and the expected `iss`.
-// - Tokens are sent to the issuer and (via shareAuthorizedFetch's own origin
-//   gate) to nobody else. A session stored for one issuer is never used for a
-//   different one after a redeployment repoints VITE_GEOLIBRE_SHARE_URL.
+// Authorization Code + S256 PKCE for the reference share server. Web uses a
+// same-origin popup and issuer-keyed tab storage; desktop uses the system
+// browser and process-memory-only tokens. Neither mode stores an access token.
+// The manager step-up grant never enters the project-session cache or storage.
 
 import { create } from "zustand";
 import type { ParseKeys } from "i18next";
+import { isDesktopRuntime } from "./is-mobile";
 import { isTauri } from "./is-tauri";
+import { getShareFetch } from "./share-fetch";
 import { resolveShareBaseUrl } from "./share-geolibre";
+import {
+  DESKTOP_SHARE_CALLBACK,
+  NativeShareCallbackError,
+  waitForNativeShareCode,
+} from "./native-share-auth";
 
-/** Public OAuth client registered on the share server for the web build. */
-const CLIENT_ID = "geolibre-web";
+export function shareOAuthClientId(): "geolibre-web" | "geolibre-desktop" {
+  return isDesktopRuntime() ? "geolibre-desktop" : "geolibre-web";
+}
 
 /** One-time PKCE/state material: 32 random bytes, unpadded base64url (43 chars). */
 const TOKEN_BYTES = 32;
@@ -65,7 +55,9 @@ export type ShareOAuthErrorCode =
   | "issuer-mismatch"
   | "malformed"
   | "exchange-failed"
-  | "refresh-unavailable";
+  | "refresh-unavailable"
+  | "setup-failed"
+  | "restart-required";
 
 /** Typed failure so the UI renders guidance (t()) instead of a raw message. */
 export class ShareOAuthError extends Error {
@@ -93,6 +85,10 @@ export function shareOAuthErrorKey(code: ShareOAuthErrorCode): ParseKeys {
       return "share.oauthTimeout";
     case "already-pending":
       return "share.oauthInProgress";
+    case "setup-failed":
+      return "share.oauthSetupFailed";
+    case "restart-required":
+      return "share.oauthRestartSignIn";
     case "not-configured":
       return "gallery.errorNotConfigured";
     default:
@@ -101,33 +97,30 @@ export function shareOAuthErrorKey(code: ShareOAuthErrorCode): ParseKeys {
 }
 
 interface ShareOAuthState {
-  /** Issuer of the active session, or null when signed out / unsupported. */
   issuer: string | null;
-  /** True while a consent popup is open and unresolved. */
+  sessionRevision: number;
   pending: boolean;
+  startupError: "restart-required" | null;
+  setupError: boolean;
 }
 
-/** Reactive session/pending state for the dialogs. */
 export const useShareOAuthStore = create<ShareOAuthState>(() => ({
   issuer: loadSignedInIssuer(),
+  sessionRevision: 0,
   pending: false,
+  startupError: null,
+  setupError: false,
 }));
 
 // ---------------------------------------------------------------------------
 // Capability and issuer resolution
 // ---------------------------------------------------------------------------
 
-/**
- * Whether this build can run the web popup flow. The desktop shell and the
- * Jupyter embed never do: desktop waits for Stack 4's system-browser flow, and
- * the embed is served from inside a notebook where a popup sign-in to a remote
- * consent page is wrong by construction. `typeof` guards keep the compiled-out
- * define references safe under the tsx test loader.
- */
+/** Desktop uses the system browser; mobile Tauri and notebook embeds stay PAT-only. */
 export function supportsShareOAuth(): boolean {
   if (typeof window === "undefined") return false;
-  if (isTauri()) return false;
   if (typeof __GEOLIBRE_EMBED_BUILD__ !== "undefined" && __GEOLIBRE_EMBED_BUILD__) return false;
+  if (isTauri()) return isDesktopRuntime() && !useShareOAuthStore.getState().setupError;
   return true;
 }
 
@@ -245,7 +238,34 @@ interface StoredSession {
   refreshToken: string;
 }
 
+let desktopRefresh: { issuer: string; refreshToken: string } | null = null;
+
+/** Main installs listener and HTTP transport before enabling native sign-in. */
+let desktopOAuthReady: Promise<void> | null = null;
+
+export function configureShareOAuthReadiness(ready: Promise<void>): void {
+  desktopOAuthReady = ready.catch(() => {
+    useShareOAuthStore.setState({ setupError: true });
+    throw new ShareOAuthError("setup-failed");
+  });
+  // Keep a startup failure observable without an unhandled rejection when no
+  // control has yet asked for the readiness promise.
+  void desktopOAuthReady.catch(() => {});
+}
+
+async function waitForDesktopOAuthReady(): Promise<void> {
+  if (!desktopOAuthReady) throw new ShareOAuthError("setup-failed");
+  await desktopOAuthReady;
+}
+
+export function markColdShareCallback(): void {
+  useShareOAuthStore.setState({ startupError: "restart-required" });
+}
+
 function readSession(issuer: string): StoredSession | null {
+  if (isDesktopRuntime()) {
+    return desktopRefresh?.issuer === issuer ? { refreshToken: desktopRefresh.refreshToken } : null;
+  }
   try {
     const raw = window.sessionStorage.getItem(SESSION_PREFIX + issuer);
     if (!raw) return null;
@@ -267,6 +287,10 @@ function readSession(issuer: string): StoredSession | null {
 }
 
 function writeSession(issuer: string, refreshToken: string): void {
+  if (isDesktopRuntime()) {
+    desktopRefresh = { issuer, refreshToken };
+    return;
+  }
   try {
     window.sessionStorage.setItem(
       SESSION_PREFIX + issuer,
@@ -278,6 +302,10 @@ function writeSession(issuer: string, refreshToken: string): void {
 }
 
 function clearStoredSession(issuer: string): void {
+  if (isDesktopRuntime()) {
+    if (desktopRefresh?.issuer === issuer) desktopRefresh = null;
+    return;
+  }
   try {
     window.sessionStorage.removeItem(SESSION_PREFIX + issuer);
   } catch {
@@ -286,6 +314,7 @@ function clearStoredSession(issuer: string): void {
 }
 
 function loadSignedInIssuer(): string | null {
+  if (isDesktopRuntime()) return null;
   if (typeof window === "undefined") return null;
   const issuer = resolveShareIssuer();
   return issuer && readSession(issuer) ? issuer : null;
@@ -300,8 +329,12 @@ interface CachedAccessToken {
 let cachedAccess: CachedAccessToken | null = null;
 let sessionGeneration = 0;
 
-function setStoreIssuer(issuer: string | null): void {
-  useShareOAuthStore.setState((state) => (state.issuer === issuer ? state : { ...state, issuer }));
+function setStoreIssuer(issuer: string | null, newGrant = false): void {
+  useShareOAuthStore.setState((state) =>
+    state.issuer === issuer && !newGrant
+      ? state
+      : { ...state, issuer, sessionRevision: state.sessionRevision + 1 },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -310,64 +343,148 @@ function setStoreIssuer(issuer: string | null): void {
 
 /** A single in-flight consent flow. A second sign-in request is rejected. */
 let pendingFlow: symbol | null = null;
+let cancelActiveDesktopFlow: (() => void) | null = null;
 
-export async function signInToShare(baseUrl?: string): Promise<void> {
+/** Cancel this process's pending desktop consent without affecting web popups. */
+export function cancelShareSignIn(): void {
+  cancelActiveDesktopFlow?.();
+}
+
+type RequestedGrant = "project" | "management";
+
+async function authorizeShareGrant(
+  baseUrl: string | undefined,
+  grant: RequestedGrant,
+): Promise<{ issuer: string; tokens: TokenResponse; generation: number } | null> {
   if (!supportsShareOAuth()) {
-    throw new ShareOAuthError("unsupported", "Web OAuth sign-in is not available in this build.");
+    throw new ShareOAuthError(
+      useShareOAuthStore.getState().setupError ? "setup-failed" : "unsupported",
+    );
   }
   const issuer = resolveShareIssuer(baseUrl);
   if (!issuer) throw new ShareOAuthError("not-configured");
   if (pendingFlow) throw new ShareOAuthError("already-pending");
   if (!window.crypto?.subtle) throw new ShareOAuthError("crypto-unavailable");
 
+  const desktop = isDesktopRuntime();
   const flow = Symbol("share-oauth-flow");
   const state = randomUrlSafeToken();
   const verifier = randomUrlSafeToken();
-  // Reserve the popup before the first await: browsers only allow window.open
-  // in the synchronous call stack of a user gesture.
-  const popup = window.open("about:blank", "geolibre-share-oauth", "popup,width=480,height=680");
-  if (!popup) throw new ShareOAuthError("popup-blocked");
+  // Reserve the popup synchronously inside the originating click on web.
+  const popup = desktop
+    ? null
+    : window.open("about:blank", "geolibre-share-oauth", "popup,width=480,height=680");
+  if (!desktop && !popup) throw new ShareOAuthError("popup-blocked");
 
   pendingFlow = flow;
-  useShareOAuthStore.setState((state) => (state.pending ? state : { ...state, pending: true }));
+  useShareOAuthStore.setState({ pending: true, startupError: null });
   const flowGeneration = sessionGeneration;
+  let cancelled = false;
+  let nativeWaiter: ReturnType<typeof waitForNativeShareCode> | null = null;
+  const cancelFlow = () => {
+    cancelled = true;
+    nativeWaiter?.cancel();
+  };
+  if (desktop) cancelActiveDesktopFlow = cancelFlow;
   try {
+    if (desktop) await waitForDesktopOAuthReady();
+    if (cancelled) throw new ShareOAuthError("cancelled");
     const challenge = await s256Challenge(verifier);
-    if (flowGeneration !== sessionGeneration) return;
-    const redirectUri = deriveCallbackUrl(window.location.origin);
+    if (cancelled) throw new ShareOAuthError("cancelled");
+    if (flowGeneration !== sessionGeneration) return null;
+    const redirectUri = desktop
+      ? DESKTOP_SHARE_CALLBACK
+      : deriveCallbackUrl(window.location.origin);
     const authorizeUrl = oauthEndpointUrl(issuer, "authorize");
     authorizeUrl.search = new URLSearchParams({
       response_type: "code",
-      client_id: CLIENT_ID,
+      client_id: shareOAuthClientId(),
       redirect_uri: redirectUri,
-      scope: "read:projects write:projects share:public",
+      scope:
+        grant === "management" ? "manage:sessions" : "read:projects write:projects share:public",
       state,
       code_challenge: challenge,
       code_challenge_method: "S256",
     }).toString();
-    popup.location.href = authorizeUrl.toString();
 
-    const code = await waitForCallbackCode(popup, { state, issuer, flow });
-    if (flowGeneration !== sessionGeneration) return;
-    const tokens = await exchangeCode(issuer, code, verifier, redirectUri);
-    if (flowGeneration !== sessionGeneration) return;
-    sessionGeneration += 1;
-    writeSession(issuer, tokens.refresh_token);
-    cachedAccess = {
-      issuer,
-      token: tokens.access_token,
-      expiresAt: Date.now() + tokens.expires_in * 1000,
-    };
-    setStoreIssuer(issuer);
+    let code: string;
+    if (desktop) {
+      const waiter = waitForNativeShareCode(state, issuer, POPUP_TIMEOUT_MS);
+      nativeWaiter = waiter;
+      // Cancellation can precede openUrl's completion; observe that rejection
+      // even before the code wait below starts awaiting it.
+      void waiter.code.catch(() => {});
+      try {
+        // Platform-only API: the web and embed bundles do not use the opener.
+        const { openUrl } = await import("@tauri-apps/plugin-opener");
+        await openUrl(authorizeUrl.toString());
+      } catch {
+        if (cancelled) throw new ShareOAuthError("cancelled");
+        waiter.cancel();
+        throw new ShareOAuthError("exchange-failed");
+      }
+      try {
+        code = await waiter.code;
+        if (cancelled) throw new ShareOAuthError("cancelled");
+      } catch (error) {
+        if (cancelled) throw new ShareOAuthError("cancelled");
+        if (error instanceof NativeShareCallbackError) throw new ShareOAuthError(error.code);
+        throw error;
+      }
+      if (cancelled) throw new ShareOAuthError("cancelled");
+    } else {
+      popup!.location.href = authorizeUrl.toString();
+      code = await waitForCallbackCode(popup!, { state, issuer, flow });
+    }
+    if (flowGeneration !== sessionGeneration) return null;
+    if (cancelled) throw new ShareOAuthError("cancelled");
+    const tokens = await exchangeCode(issuer, code, verifier, redirectUri, grant);
+    if (cancelled) throw new ShareOAuthError("cancelled");
+    if (flowGeneration !== sessionGeneration) return null;
+    return { issuer, tokens, generation: flowGeneration };
   } finally {
+    if (cancelActiveDesktopFlow === cancelFlow) cancelActiveDesktopFlow = null;
     if (pendingFlow === flow) {
       pendingFlow = null;
-      useShareOAuthStore.setState((state) =>
-        state.pending ? { ...state, pending: false } : state,
-      );
+      useShareOAuthStore.setState({ pending: false });
     }
-    popup.close();
+    popup?.close();
   }
+}
+
+export async function signInToShare(baseUrl?: string): Promise<void> {
+  const result = await authorizeShareGrant(baseUrl, "project");
+  if (!result) return;
+  if (result.generation !== sessionGeneration) return;
+  const { issuer, tokens } = result;
+  if (!tokens.refresh_token) throw new ShareOAuthError("exchange-failed");
+  sessionGeneration += 1;
+  writeSession(issuer, tokens.refresh_token);
+  cachedAccess = {
+    issuer,
+    token: tokens.access_token,
+    expiresAt: Date.now() + tokens.expires_in * 1000,
+  };
+  setStoreIssuer(issuer, true);
+}
+
+export interface ShareManagementGrant {
+  issuer: string;
+  accessToken: string;
+  expiresAt: number;
+}
+
+/** Fresh step-up consent only; never shares the project token cache or storage. */
+export async function authorizeShareManagement(baseUrl?: string): Promise<ShareManagementGrant> {
+  const result = await authorizeShareGrant(baseUrl, "management");
+  if (!result || result.generation !== sessionGeneration || result.tokens.refresh_token) {
+    throw new ShareOAuthError("exchange-failed");
+  }
+  return {
+    issuer: result.issuer,
+    accessToken: result.tokens.access_token,
+    expiresAt: Date.now() + result.tokens.expires_in * 1000,
+  };
 }
 
 /** Resolve with the authorization code from the popup, or reject. */
@@ -451,7 +568,14 @@ async function fetchTokenEndpoint(
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), TOKEN_REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
+    if (isDesktopRuntime()) await waitForDesktopOAuthReady();
+    const response = await getShareFetch()(url, {
+      ...init,
+      redirect: "error",
+      signal: controller.signal,
+    });
+    if (response.status >= 300 && response.status < 400)
+      throw new ShareOAuthError("exchange-failed");
     const body = await readTokenResponseBody(response);
     return { response, body };
   } finally {
@@ -461,7 +585,7 @@ async function fetchTokenEndpoint(
 
 interface TokenResponse {
   access_token: string;
-  refresh_token: string;
+  refresh_token?: string;
   expires_in: number;
 }
 
@@ -471,6 +595,7 @@ async function exchangeCode(
   code: string,
   verifier: string,
   redirectUri: string,
+  grant: RequestedGrant,
 ): Promise<TokenResponse> {
   let response: Response;
   let body: unknown;
@@ -480,7 +605,7 @@ async function exchangeCode(
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "authorization_code",
-        client_id: CLIENT_ID,
+        client_id: shareOAuthClientId(),
         code,
         redirect_uri: redirectUri,
         code_verifier: verifier,
@@ -494,8 +619,9 @@ async function exchangeCode(
     !response.ok ||
     typeof payload?.access_token !== "string" ||
     !payload.access_token ||
-    typeof payload?.refresh_token !== "string" ||
-    !payload.refresh_token
+    (grant === "project" &&
+      (typeof payload.refresh_token !== "string" || !payload.refresh_token)) ||
+    (grant === "management" && payload.refresh_token !== undefined)
   ) {
     throw new ShareOAuthError("exchange-failed", "The share server rejected the sign-in.");
   }
@@ -527,6 +653,7 @@ export async function getShareAccessToken(baseUrl?: string): Promise<string | nu
   if (!supportsShareOAuth()) return null;
   const issuer = resolveShareIssuer(baseUrl);
   if (!issuer) return null;
+  if (isDesktopRuntime()) await waitForDesktopOAuthReady();
 
   if (
     cachedAccess &&
@@ -585,7 +712,7 @@ async function refreshAccessToken(
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
         grant_type: "refresh_token",
-        client_id: CLIENT_ID,
+        client_id: shareOAuthClientId(),
         refresh_token: refreshToken,
       }),
     }));
@@ -649,11 +776,12 @@ export async function signOutOfShare(baseUrl?: string): Promise<void> {
   if (loadSignedInIssuer() === null) setStoreIssuer(null);
   if (!session) return;
   try {
-    await fetch(oauthEndpointUrl(issuer, "revoke"), {
+    await getShareFetch()(oauthEndpointUrl(issuer, "revoke"), {
       method: "POST",
+      redirect: "error",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
-        client_id: CLIENT_ID,
+        client_id: shareOAuthClientId(),
         token: session.refreshToken,
         token_type_hint: "refresh_token",
       }),

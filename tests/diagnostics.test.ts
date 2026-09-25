@@ -102,6 +102,36 @@ describe("diagnostics network info capture", () => {
     assert.ok(!record.detail?.includes("SECRET123"));
   });
 
+  it("removes OAuth secrets from callback URLs and embedded diagnostic text", () => {
+    appendDiagnostic({
+      category: "runtime",
+      level: "error",
+      message:
+        "Deep link failed (org.geolibre.desktop:/oauth/callback?code=CALLBACK_CODE&state=CALLBACK_STATE&iss=https%3A%2F%2Fshare.geolibre.app)",
+      detail:
+        "Exchange failed for https://share.geolibre.app/oauth/token?code_verifier=PKCE_SECRET&refresh_token=REFRESH_SECRET&safe=visible",
+      source: "org.geolibre.desktop:/oauth/callback?code=SOURCE_CODE",
+      url: "org.geolibre.desktop:/oauth/callback?code=URL_CODE&state=URL_STATE",
+    });
+    const [record] = getDiagnosticsSnapshot().records;
+    const exported = JSON.stringify(record);
+    for (const secret of [
+      "CALLBACK_CODE",
+      "CALLBACK_STATE",
+      "PKCE_SECRET",
+      "REFRESH_SECRET",
+      "SOURCE_CODE",
+      "URL_CODE",
+      "URL_STATE",
+    ]) {
+      assert.ok(!exported.includes(secret), `${secret} escaped redaction`);
+    }
+    assert.ok(record.message.includes("org.geolibre.desktop:/oauth/callback"));
+    assert.ok(record.detail?.includes("safe=visible"));
+    assert.ok(record.source?.includes("REDACTED"));
+    assert.ok(record.url?.includes("REDACTED"));
+  });
+
   it("does not filter info-level entries from other categories", () => {
     appendDiagnostic({
       category: "console",
