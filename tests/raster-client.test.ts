@@ -129,6 +129,93 @@ describe("raster-client compute", () => {
     assert.ok(Math.abs(asp - 315) < 0.05);
   });
 
+  it("computes the same terrain products for south-up geographic rasters", () => {
+    // A one-degree-pixel grid centred on 60 N stored north-up vs south-up:
+    // the south-up file puts originY on the southern edge, so the mid-latitude
+    // sign must follow flipY (wrong sign computes cos(57 deg) instead of
+    // cos(60 deg), an ~8% slope error on this grid).
+    const band = [0, 5566, 11132, 0, 5566, 11132, 0, 5566, 11132];
+    const resXDeg = 2; // 1 deg of longitude at 60 N ~ 55.66 km
+    const resYDeg = 1;
+    const northUp = makeRaster([band], 3, 3, {
+      resX: resXDeg,
+      resY: resYDeg,
+      originY: 61.5, // northern edge
+      flipY: false,
+    });
+    const southUp = makeRaster([band], 3, 3, {
+      resX: resXDeg,
+      resY: resYDeg,
+      originY: 58.5, // southern edge
+      flipY: true,
+    });
+    const deg = slope(southUp, { units: "degrees" }).bands[0][4];
+    assert.equal(deg, slope(northUp, { units: "degrees" }).bands[0][4]);
+    assert.ok(Math.abs(deg - (Math.atan(5566 / 111320) * 180) / Math.PI) < 1e-4);
+  });
+
+  it("honours non-degree angular units before scaling", () => {
+    // The same ~30.87 m equator grid as above, with the cell size stored in
+    // arc-minutes (GeoTIFF GeogAngularUnitsGeoKey 9103): the values are 60x
+    // their degree equivalents and must be converted before the metre scale.
+    const resArcMin = (30.87 / 111320) * 60;
+    const band = [0, 10, 20, 0, 10, 20, 0, 10, 20];
+    const geoKeys = (unit: number) => ({
+      GTModelTypeGeoKey: 2,
+      GeographicTypeGeoKey: 4326,
+      GeogAngularUnitsGeoKey: unit,
+    });
+    const arcMin = makeRaster([band], 3, 3, {
+      resX: resArcMin,
+      resY: resArcMin,
+      originY: resArcMin * 3,
+      geoKeys: geoKeys(9103),
+    });
+    const deg = slope(arcMin, { units: "degrees" }).bands[0][4];
+    assert.ok(Math.abs(deg - (Math.atan(10 / 30.87) * 180) / Math.PI) < 0.01);
+    // Unsupported units (radians here) fall back to the unscaled behaviour.
+    const radian = makeRaster([band], 3, 3, {
+      resX: resArcMin,
+      resY: resArcMin,
+      originY: resArcMin * 3,
+      geoKeys: geoKeys(9102),
+    });
+    const unscaled = makeRaster([band], 3, 3, {
+      resX: resArcMin,
+      resY: resArcMin,
+      originY: resArcMin * 3,
+      geoKeys: {},
+    });
+    assert.equal(
+      slope(radian, { units: "degrees" }).bands[0][4],
+      slope(unscaled, { units: "degrees" }).bands[0][4],
+    );
+  });
+
+  it("renders the same hillshade for geographic and projected rasters of one terrain", () => {
+    // Identical 30.87 m ground grid at 60 N, expressed in metres and in
+    // degrees: hillshade and aspect must agree exactly. The old range-only
+    // assertion (0-255) passed even with broken scaling, so pin the values.
+    const band = [0, 10, 20, 10, 20, 30, 20, 30, 40];
+    const projected = makeRaster([band], 3, 3, {
+      resX: 30.87,
+      resY: 30.87,
+      geoKeys: { GTModelTypeGeoKey: 1, ProjectedCSTypeGeoKey: 32650 },
+    });
+    const resYDeg = 30.87 / 111320;
+    const geographic = makeRaster([band], 3, 3, {
+      resX: resYDeg / Math.cos((60 * Math.PI) / 180),
+      resY: resYDeg,
+      originY: 60 + 1.5 * resYDeg,
+    });
+    const sun = { azimuth: 315, altitude: 45, z_factor: 1 };
+    assert.ok(
+      Math.abs(hillshade(projected, sun).bands[0][4] - hillshade(geographic, sun).bands[0][4]) <
+        1e-3,
+    );
+    assert.ok(Math.abs(aspect(projected).bands[0][4] - aspect(geographic).bands[0][4]) < 1e-3);
+  });
+
   it("computes hillshade within 0-255 and aspect within range", () => {
     const ramp = makeRaster([[0, 1, 2, 0, 1, 2, 0, 1, 2]], 3, 3);
     const hs = hillshade(ramp, { azimuth: 315, altitude: 45, z_factor: 1 }).bands[0][4];

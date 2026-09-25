@@ -224,6 +224,16 @@ function gradY(win: number[], resY: number): number {
 const METERS_PER_DEGREE = 111320;
 
 /**
+ * Degrees spanned by one GeoTIFF angular unit (EPSG unit codes from the spec).
+ * The spec default when the key is absent is degrees.
+ */
+const DEGREES_PER_ANGULAR_UNIT: Record<number, number> = {
+  9101: 1, // degree
+  9103: 1 / 60, // arc-minute
+  9104: 1 / 3600, // arc-second
+};
+
+/**
  * Terrain gradients compare elevation (metres) against horizontal distance, so
  * their denominators must be metres. Rasters stored in a geographic CRS (the
  * distribution format of SRTM/AW3D30/Copernicus DEM) have cell sizes in
@@ -241,13 +251,22 @@ function gradientResolutions(input: RasterData): { resX: number; resY: number } 
   if (!isGeographic) {
     return { resX: input.resX, resY: input.resY };
   }
+  const unitKey = geoKeys.GeogAngularUnitsGeoKey as number | undefined;
+  const degreesPerUnit = unitKey == null ? 1 : DEGREES_PER_ANGULAR_UNIT[unitKey];
+  if (degreesPerUnit == null) {
+    // Exotic angular unit (radians, grads, ...): leave the cell size alone
+    // rather than guess — the pre-scaling behaviour for such georeferencing.
+    return { resX: input.resX, resY: input.resY };
+  }
   // North-up GeoTIFFs put originY on the top (northern) edge; south-up rasters
-  // (flipY) would need the mid-latitude sign flipped and are not handled here.
-  const midLat = input.originY - (input.height * input.resY) / 2;
+  // (flipY) put it on the southern edge, so the mid-latitude sign follows flipY.
+  const halfSpan = (input.height * input.resY) / 2;
+  const midLat =
+    (input.flipY ? input.originY + halfSpan : input.originY - halfSpan) * degreesPerUnit;
   const lonScale = Math.max(Math.cos((midLat * Math.PI) / 180), 1e-4);
   return {
-    resX: input.resX * METERS_PER_DEGREE * lonScale,
-    resY: input.resY * METERS_PER_DEGREE,
+    resX: input.resX * degreesPerUnit * METERS_PER_DEGREE * lonScale,
+    resY: input.resY * degreesPerUnit * METERS_PER_DEGREE,
   };
 }
 
