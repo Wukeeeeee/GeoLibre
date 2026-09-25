@@ -92,14 +92,28 @@ export async function readNativeZarrDimensions(
       continue;
     try {
       const coordinate = await zarr.open(root.resolve(parent + name), { kind: "array" });
+      // CF time axes are often int64 ("days since ..."), which zarrita reads as
+      // BigInt; skipping them left such a cube with no Time Slider binding.
       if (
-        !coordinate.is("number") ||
+        !(coordinate.is("number") || coordinate.is("bigint")) ||
         coordinate.shape.length !== 1 ||
         coordinate.shape[0] > 1_000_000
       )
         continue;
       const values = await zarr.get(coordinate, [null]);
-      result[name] = Array.from(values.data);
+      const raw = Array.from(values.data as ArrayLike<number | bigint>);
+      // Number() rounds a BigInt past 2^53 silently, so an int64 axis in
+      // nanoseconds (datetime64[ns], ~1.7e18) would collapse adjacent
+      // timestamps. Leave such an axis out rather than bind a wrong one.
+      if (
+        raw.some(
+          (value) =>
+            typeof value === "bigint" &&
+            (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER)),
+        )
+      )
+        continue;
+      result[name] = raw.map(Number);
     } catch (error) {
       if (!(error instanceof zarr.NotFoundError)) throw error;
     }
