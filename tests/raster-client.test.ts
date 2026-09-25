@@ -349,6 +349,28 @@ describe("raster-client GeoTIFF round-trip", () => {
     assert.deepEqual(Array.from(back.bands[0]), [1, 2, 3, 4, 5, 6]);
   });
 
+  it("preserves GeogAngularUnitsGeoKey across a write-read round trip", async () => {
+    // Tool output written from a non-degree geographic raster must keep its
+    // angular-unit tag: if the writer drops it, the next client tool that
+    // reads the file assumes degrees and silently rescales by 60x (arc-min)
+    // to 3600x (arc-sec) — the very bug the terrain scaling fixes.
+    const resArcMin = (30.87 / 111320) * 60;
+    const raster = makeRaster([[0, 10, 20, 0, 10, 20, 0, 10, 20]], 3, 3, {
+      resX: resArcMin,
+      resY: resArcMin,
+      originY: resArcMin * 3,
+      geoKeys: {
+        GTModelTypeGeoKey: 2,
+        GeographicTypeGeoKey: 4326,
+        GeogAngularUnitsGeoKey: 9103,
+      },
+    });
+    const back = await readRasterData(writeRasterBands(raster));
+    assert.equal(back.geoKeys.GeogAngularUnitsGeoKey, 9103);
+    const deg = slope(back, { units: "degrees" }).bands[0][4];
+    assert.ok(Math.abs(deg - (Math.atan(10 / 30.87) * 180) / Math.PI) < 0.01);
+  });
+
   it("writes and reads back a multi-band raster with correct interleaving", async () => {
     const raster = makeRaster(
       [

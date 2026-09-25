@@ -69,12 +69,17 @@ export function supportsClientRaster(id: string): boolean {
 
 // --- GeoTIFF I/O -----------------------------------------------------------
 
-/** GeoKeys the writer understands; copied from the source to keep the CRS. */
+/**
+ * GeoKeys the writer understands; copied from the source to keep the CRS and
+ * the angular unit the terrain scaling keys off (dropping the unit tag would
+ * make re-read tool output default to degrees and rescale wrongly).
+ */
 const PRESERVED_GEO_KEYS = [
   "GTModelTypeGeoKey",
   "GTRasterTypeGeoKey",
   "GeographicTypeGeoKey",
   "ProjectedCSTypeGeoKey",
+  "GeogAngularUnitsGeoKey",
 ] as const;
 
 /**
