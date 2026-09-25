@@ -81,13 +81,52 @@ describe("raster-client compute", () => {
   });
 
   it("computes a non-zero slope on an inclined surface", () => {
-    // West-to-east ramp: each column one unit higher than the last.
-    const ramp = makeRaster([[0, 1, 2, 0, 1, 2, 0, 1, 2]], 3, 3);
+    // West-to-east ramp on a projected (metres) raster: each column one metre
+    // higher than the last, so the gradient is exactly 1:1.
+    const ramp = makeRaster([[0, 1, 2, 0, 1, 2, 0, 1, 2]], 3, 3, {
+      geoKeys: { GTModelTypeGeoKey: 1, ProjectedCSTypeGeoKey: 32650 },
+    });
     const deg = slope(ramp, { units: "degrees" }).bands[0][4];
-    assert.ok(deg > 0);
+    assert.ok(Math.abs(deg - 45) < 1e-9);
     // A 1:1 (45 degree-ish) gradient: percent form is gradient * 100.
     const pct = slope(ramp, { units: "percent" }).bands[0][4];
     assert.ok(Math.abs(pct - 100) < 1e-6);
+  });
+
+  it("scales gradients to metres for geographic-CRS (4326) DEMs", () => {
+    // A 10 m rise per pixel on a ~30.87 m ground grid near the equator (a ~32%
+    // grade, atan(10/30.87) ~ 17.9 deg). The cell size arrives in degrees
+    // (30.87 / 111320), which the engine used to divide as if they were
+    // metres, saturating the slope at 90 deg.
+    const resDeg = 30.87 / 111320;
+    const ramp = makeRaster([[0, 10, 20, 0, 10, 20, 0, 10, 20]], 3, 3, {
+      resX: resDeg,
+      resY: resDeg,
+      originY: resDeg * 3, // top (northern) edge, so mid-latitude ~ equator
+    });
+    const deg = slope(ramp, { units: "degrees" }).bands[0][4];
+    assert.ok(Math.abs(deg - (Math.atan(10 / 30.87) * 180) / Math.PI) < 0.01);
+    const pct = slope(ramp, { units: "percent" }).bands[0][4];
+    assert.ok(Math.abs(pct - (10 / 30.87) * 100) < 0.01);
+  });
+
+  it("does not skew east-west gradients at high latitude", () => {
+    // Same 10 m rise per pixel in both axes at 60 N, where one degree of
+    // longitude spans only ~55.7 km. Equal metre gradients must give equal
+    // axis gradients (slope atan(sqrt(2) * 10/30.87) ~ 24.6 deg, downhill
+    // toward north-west, aspect 315) instead of the ~1/cos(lat) skew toward
+    // north-south that raw degree divisions produced.
+    const resYDeg = 30.87 / 111320;
+    const resXDeg = resYDeg / Math.cos((60 * Math.PI) / 180);
+    const ramp = makeRaster([[0, 10, 20, 10, 20, 30, 20, 30, 40]], 3, 3, {
+      resX: resXDeg,
+      resY: resYDeg,
+      originY: 60 + resYDeg * 3, // top edge just north of 60 N
+    });
+    const deg = slope(ramp, { units: "degrees" }).bands[0][4];
+    assert.ok(Math.abs(deg - (Math.atan(Math.sqrt(2) * (10 / 30.87)) * 180) / Math.PI) < 0.05);
+    const asp = aspect(ramp).bands[0][4];
+    assert.ok(Math.abs(asp - 315) < 0.05);
   });
 
   it("computes hillshade within 0-255 and aspect within range", () => {
