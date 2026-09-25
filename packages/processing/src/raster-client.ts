@@ -221,14 +221,17 @@ function gradY(win: number[], resY: number): number {
 /**
  * Metres per degree of latitude on WGS84 (same constant terrain-viewshed uses).
  */
-const METERS_PER_DEGREE = 111320;
+const METERS_PER_DEGREE_LAT = 111320;
 
 /**
- * Degrees spanned by one GeoTIFF angular unit (EPSG unit codes from the spec).
- * The spec default when the key is absent is degrees.
+ * Degrees spanned by one GeoTIFF angular unit, keyed by the EPSG unit codes
+ * the spec assigns (GeoTIFF 1.0, "Angular Units Codes": 9101 radian, 9102
+ * degree, 9103 arc-minute, 9104 arc-second). The spec default when the key is
+ * absent is degrees.
  */
 const DEGREES_PER_ANGULAR_UNIT: Record<number, number> = {
-  9101: 1, // degree
+  9101: 180 / Math.PI, // radian
+  9102: 1, // degree
   9103: 1 / 60, // arc-minute
   9104: 1 / 3600, // arc-second
 };
@@ -254,19 +257,23 @@ function gradientResolutions(input: RasterData): { resX: number; resY: number } 
   const unitKey = geoKeys.GeogAngularUnitsGeoKey as number | undefined;
   const degreesPerUnit = unitKey == null ? 1 : DEGREES_PER_ANGULAR_UNIT[unitKey];
   if (degreesPerUnit == null) {
-    // Exotic angular unit (radians, grads, ...): leave the cell size alone
-    // rather than guess — the pre-scaling behaviour for such georeferencing.
-    return { resX: input.resX, resY: input.resY };
+    // Grads, gons and other codes we cannot convert: fail loudly rather than
+    // hand raw angular cell sizes to the terrain math as if they were metres.
+    throw new Error(
+      `Unsupported geographic angular unit (GeogAngularUnitsGeoKey ${unitKey}). Convert the raster or use the sidecar (rasterio/GDAL) engine instead.`,
+    );
   }
   // North-up GeoTIFFs put originY on the top (northern) edge; south-up rasters
   // (flipY) put it on the southern edge, so the mid-latitude sign follows flipY.
   const halfSpan = (input.height * input.resY) / 2;
   const midLat =
     (input.flipY ? input.originY + halfSpan : input.originY - halfSpan) * degreesPerUnit;
+  // Clamped so near-polar extents (cos -> 0) cannot collapse the east-west
+  // denominators to zero; at the clamp the correction is meaningless anyway.
   const lonScale = Math.max(Math.cos((midLat * Math.PI) / 180), 1e-4);
   return {
-    resX: input.resX * degreesPerUnit * METERS_PER_DEGREE * lonScale,
-    resY: input.resY * degreesPerUnit * METERS_PER_DEGREE,
+    resX: input.resX * degreesPerUnit * METERS_PER_DEGREE_LAT * lonScale,
+    resY: input.resY * degreesPerUnit * METERS_PER_DEGREE_LAT,
   };
 }
 

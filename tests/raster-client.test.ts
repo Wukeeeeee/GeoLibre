@@ -154,42 +154,58 @@ describe("raster-client compute", () => {
     assert.ok(Math.abs(deg - (Math.atan(5566 / 111320) * 180) / Math.PI) < 1e-4);
   });
 
-  it("honours non-degree angular units before scaling", () => {
-    // The same ~30.87 m equator grid as above, with the cell size stored in
-    // arc-minutes (GeoTIFF GeogAngularUnitsGeoKey 9103): the values are 60x
-    // their degree equivalents and must be converted before the metre scale.
-    const resArcMin = (30.87 / 111320) * 60;
+  it("honours GeoTIFF angular unit codes before scaling", () => {
+    // The same ~30.87 m equator grid as above, expressed in each EPSG angular
+    // unit. Per the GeoTIFF 1.0 unit table: 9101 radian, 9102 degree, 9103
+    // arc-minute, 9104 arc-second; the key defaults to degrees when absent.
     const band = [0, 10, 20, 0, 10, 20, 0, 10, 20];
-    const geoKeys = (unit: number) => ({
+    const resDeg = 30.87 / 111320;
+    const geoKeys = (unit: number | null) => ({
       GTModelTypeGeoKey: 2,
       GeographicTypeGeoKey: 4326,
-      GeogAngularUnitsGeoKey: unit,
+      ...(unit == null ? {} : { GeogAngularUnitsGeoKey: unit }),
     });
+    const degAtEquator = (Math.atan(10 / 30.87) * 180) / Math.PI;
+    // A file that spells out the degree code explicitly must still scale —
+    // treating 9102 as unsupported would silently reintroduce the raw-degree
+    // bug for exactly the files that declare their units the standard way.
+    const explicitDegree = makeRaster([band], 3, 3, {
+      resX: resDeg,
+      resY: resDeg,
+      originY: resDeg * 3,
+      geoKeys: geoKeys(9102),
+    });
+    assert.ok(
+      Math.abs(slope(explicitDegree, { units: "degrees" }).bands[0][4] - degAtEquator) < 0.01,
+    );
+    // Arc-minutes are 1/60 of a degree, so the numeric cell size is 60x.
+    const resArcMin = resDeg * 60;
     const arcMin = makeRaster([band], 3, 3, {
       resX: resArcMin,
       resY: resArcMin,
       originY: resArcMin * 3,
       geoKeys: geoKeys(9103),
     });
-    const deg = slope(arcMin, { units: "degrees" }).bands[0][4];
-    assert.ok(Math.abs(deg - (Math.atan(10 / 30.87) * 180) / Math.PI) < 0.01);
-    // Unsupported units (radians here) fall back to the unscaled behaviour.
+    assert.ok(Math.abs(slope(arcMin, { units: "degrees" }).bands[0][4] - degAtEquator) < 0.01);
+    // Radians: resRad degrees * (PI / 180); the engine converts back via 180/PI.
+    const resRad = resDeg * (Math.PI / 180);
     const radian = makeRaster([band], 3, 3, {
-      resX: resArcMin,
-      resY: resArcMin,
-      originY: resArcMin * 3,
-      geoKeys: geoKeys(9102),
+      resX: resRad,
+      resY: resRad,
+      originY: resRad * 3,
+      geoKeys: geoKeys(9101),
     });
-    const unscaled = makeRaster([band], 3, 3, {
-      resX: resArcMin,
-      resY: resArcMin,
-      originY: resArcMin * 3,
-      geoKeys: {},
+    assert.ok(Math.abs(slope(radian, { units: "degrees" }).bands[0][4] - degAtEquator) < 0.01);
+    // Units we cannot convert (grads) fail loudly instead of returning
+    // plausible-but-wrong terrain values built on unconverted cell sizes.
+    const grads = makeRaster([band], 3, 3, {
+      resX: resDeg * 0.9,
+      resY: resDeg * 0.9,
+      originY: resDeg * 0.9 * 3,
+      geoKeys: geoKeys(9105),
     });
-    assert.equal(
-      slope(radian, { units: "degrees" }).bands[0][4],
-      slope(unscaled, { units: "degrees" }).bands[0][4],
-    );
+    assert.throws(() => slope(grads, { units: "degrees" }), /Unsupported geographic angular unit/);
+    assert.throws(() => hillshade(grads, {}), /Unsupported geographic angular unit/);
   });
 
   it("renders the same hillshade for geographic and projected rasters of one terrain", () => {
