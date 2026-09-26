@@ -432,4 +432,32 @@ describe("elevation-profile Open-Meteo client", () => {
       ElevationFetchError,
     );
   });
+
+  it("normalizes out-of-range longitudes and clamps latitudes before querying Open-Meteo", async () => {
+    let requestedUrl = "";
+    const mockFetch: FetchLike = (url) => {
+      requestedUrl = url;
+      return Promise.resolve(
+        new Response(JSON.stringify({ elevation: [15, 25] }), { status: 200 }),
+      );
+    };
+
+    const result = await fetchElevations(
+      [
+        [181.5, 95.0],
+        [-185.0, -92.0],
+      ],
+      mockFetch,
+    );
+
+    assert.deepEqual(result, [15, 25]);
+    assert.ok(
+      requestedUrl.includes("longitude=-178.500000,175.000000"),
+      `Expected normalized longitudes in URL, got: ${requestedUrl}`,
+    );
+    assert.ok(
+      requestedUrl.includes("latitude=90.000000,-90.000000"),
+      `Expected clamped latitudes in URL, got: ${requestedUrl}`,
+    );
+  });
 });
