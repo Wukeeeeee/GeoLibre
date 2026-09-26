@@ -460,4 +460,20 @@ describe("elevation-profile Open-Meteo client", () => {
       `Expected clamped latitudes in URL, got: ${requestedUrl}`,
     );
   });
+
+  it("rejects non-finite coordinates instead of querying (0, 0)", async () => {
+    let called = false;
+    const mockFetch: FetchLike = () => {
+      called = true;
+      return Promise.resolve(new Response(JSON.stringify({ elevation: [0] }), { status: 200 }));
+    };
+
+    for (const point of [
+      [Number.NaN, 10],
+      [10, Number.POSITIVE_INFINITY],
+    ] as LngLat[]) {
+      await assert.rejects(fetchElevations([point], mockFetch), ElevationFetchError);
+    }
+    assert.equal(called, false);
+  });
 });
