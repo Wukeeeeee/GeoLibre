@@ -64,7 +64,7 @@ interface ElevationResponse {
  */
 export function normalizeLongitude(lng: number): number {
   if (!Number.isFinite(lng)) return 0;
-  return (((lng + 180) % 360 + 360) % 360) - 180;
+  return ((((lng + 180) % 360) + 360) % 360) - 180;
 }
 
 /**
