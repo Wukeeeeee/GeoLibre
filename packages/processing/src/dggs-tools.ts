@@ -14,7 +14,7 @@ import {
   buildA5CompactSql,
   buildA5ExpandCountSql,
   buildA5ExpandSql,
-  buildA5GridFromBboxSql,
+  buildA5GridFromBboxesSql,
   buildA5GridFromSourceSql,
   A5_HARD_CAP,
   A5_MAX_TOOL_RES,
@@ -25,7 +25,7 @@ import {
 import {
   buildDggridBinSql,
   buildDggridGridFromSourceSql,
-  buildDggridGridFromWktSql,
+  buildDggridGridFromBboxesSql,
   DEFAULT_DGGRID_GRID_TYPE,
   DGGRID_GRID_TYPE_OPTIONS,
   DGGRID_HARD_CAP,
@@ -77,7 +77,7 @@ import {
   bboxAreaKm2,
   bboxToWktPolygon,
   buildBinSql,
-  buildGridFromBboxSql,
+  buildGridFromBboxesSql,
   buildGridFromSourceSql,
   buildH3CompactSql,
   buildH3ExpandCountSql,
@@ -189,19 +189,6 @@ function mergeParts(collections: FeatureCollection[]): FeatureCollection {
     }
   }
   return { type: "FeatureCollection", features };
-}
-
-/** Dedupe rows across dateline-split halves, matching a per-query `SELECT DISTINCT`. */
-function mergeRows(rows: Record<string, unknown>[], column: string): Record<string, unknown>[] {
-  const seen = new Set<string>();
-  const merged: Record<string, unknown>[] = [];
-  for (const row of rows) {
-    const key = String(row[column]);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push(row);
-  }
-  return merged;
 }
 
 /** Total area of a dateline-split area, so resolution suggestions match it. */
@@ -545,10 +532,17 @@ export const createDggsGridTool: ProcessingAlgorithm = {
           unwrap: fixAntimeridian,
           compact: compactCells,
         };
-        const fc =
-          areaBboxes != null
-            ? mergeParts(areaBboxes.map((box) => s2GridFromBbox(box, res, gridOpts)))
-            : s2GridFromFeatureCollection(inputGeojson!, res, gridOpts);
+        let fc: FeatureCollection;
+        if (areaBboxes) {
+          // Cover each part uncompacted, then compact the union once, so a
+          // parent whose children straddle ±180 can still fold back together.
+          fc = mergeParts(
+            areaBboxes.map((box) => s2GridFromBbox(box, res, { ...gridOpts, compact: false })),
+          );
+          if (compactCells) fc = compactS2FeatureCollection(fc, { unwrap: fixAntimeridian });
+        } else {
+          fc = s2GridFromFeatureCollection(inputGeojson!, res, gridOpts);
+        }
         if (fc.features.length === 0) {
           ctx.log(
             `No S2 cells were produced at resolution ${res}. Try a finer resolution or a larger area.`,
@@ -573,17 +567,20 @@ export const createDggsGridTool: ProcessingAlgorithm = {
     // DGGAL is client-side WASM (dggal); no DuckDB.
     if (type === "dggal") {
       try {
-        const fc = await withDggalDggrs(dggalType, (engine) =>
-          areaBboxes != null
-            ? mergeParts(
-                areaBboxes.map((box) =>
-                  dggalGridFromBbox(engine, box, res, hardCap, { compact: compactCells }),
-                ),
-              )
-            : dggalGridFromFeatureCollection(engine, inputGeojson!, res, hardCap, {
-                compact: compactCells,
-              }),
-        );
+        const fc = await withDggalDggrs(dggalType, (engine) => {
+          if (!areaBboxes) {
+            return dggalGridFromFeatureCollection(engine, inputGeojson!, res, hardCap, {
+              compact: compactCells,
+            });
+          }
+          // As with S2: cover uncompacted, merge, compact the union once.
+          const merged = mergeParts(
+            areaBboxes.map((box) =>
+              dggalGridFromBbox(engine, box, res, hardCap, { compact: false }),
+            ),
+          );
+          return compactCells ? compactDggalFeatureCollection(engine, merged) : merged;
+        });
         if (fc.features.length === 0) {
           ctx.log(
             `No ${label} cells were produced at resolution ${res}. Try a finer resolution or a larger area.`,
@@ -612,20 +609,16 @@ export const createDggsGridTool: ProcessingAlgorithm = {
       await duckdb.ensureExtensions(["spatial", extension!]);
       let rows: Record<string, unknown>[];
       if (areaBboxes) {
-        // One query per part; a dateline-split area needs its halves unioned
-        // here because each `SELECT DISTINCT` only sees its own box.
-        const column = type === "a5" ? "a5" : type === "dggrid" ? "dggrid" : "h3";
-        const collected: Record<string, unknown>[] = [];
-        for (const box of areaBboxes) {
-          const sql =
-            type === "a5"
-              ? buildA5GridFromBboxSql(box, res, compactCells)
-              : type === "dggrid"
-                ? buildDggridGridFromWktSql(bboxToWktPolygon(box), res, dggridType)
-                : buildGridFromBboxSql(box, res, compactCells);
-          collected.push(...(await duckdb.query(sql)));
-        }
-        rows = mergeRows(collected, column);
+        // All parts in one query: each part is unioned in, so `DISTINCT` and
+        // the compaction step both see the whole set and a cell straddling
+        // ±180 is neither duplicated nor left uncompacted.
+        const sql =
+          type === "a5"
+            ? buildA5GridFromBboxesSql(areaBboxes, res, compactCells)
+            : type === "dggrid"
+              ? buildDggridGridFromBboxesSql(areaBboxes, res, dggridType)
+              : buildGridFromBboxesSql(areaBboxes, res, compactCells);
+        rows = await duckdb.query(sql);
       } else {
         registered = await duckdb.registerGeoJson(inputGeojson!);
         const sql =

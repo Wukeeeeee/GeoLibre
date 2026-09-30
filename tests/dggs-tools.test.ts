@@ -452,15 +452,15 @@ describe("dggs generator", () => {
       resolution: 4,
     });
     await createDggsGridTool.run(ctx);
-    assert.equal(duckdb.queries.length, 2);
-    assert.match(duckdb.queries[0], /POLYGON\(\(177\.5 -18, 180 -18, 180 -16, 177\.5 -16/);
-    assert.match(duckdb.queries[1], /POLYGON\(\(-180 -18, -179\.5 -18, -179\.5 -16, -180 -16/);
-    for (const sql of duckdb.queries) {
-      // The old behaviour unioned two whole hemispheres; no half-world ring
-      // should remain.
-      assert.doesNotMatch(sql, /-180 -18, 0 -18/);
-      assert.doesNotMatch(sql, /0 -18, 180 -18/);
-    }
+    // One query, both halves unioned in.
+    assert.equal(duckdb.queries.length, 1);
+    const sql = duckdb.queries[0]!;
+    assert.match(sql, /POLYGON\(\(177\.5 -18, 180 -18, 180 -16, 177\.5 -16/);
+    assert.match(sql, /POLYGON\(\(-180 -18, -179\.5 -18, -179\.5 -16, -180 -16/);
+    // The old behaviour unioned two whole hemispheres; no half-world ring
+    // should remain.
+    assert.doesNotMatch(sql, /-180 -18, 0 -18/);
+    assert.doesNotMatch(sql, /0 -18, 180 -18/);
   });
 
   it("splits a polygon layer whose vertices outnumber its two extremes", async () => {
@@ -473,9 +473,29 @@ describe("dggs generator", () => {
       resolution: 4,
     });
     await createDggsGridTool.run(ctx);
-    assert.equal(duckdb.queries.length, 2);
-    assert.match(duckdb.queries[0], /POLYGON\(\(177\.2 -18\.9, 180 -18\.9, 180 -16\.4/);
-    assert.match(duckdb.queries[1], /POLYGON\(\(-180 -18\.9, -178(\.0)? -18\.9/);
+    assert.equal(duckdb.queries.length, 1);
+    const sql = duckdb.queries[0]!;
+    assert.match(sql, /POLYGON\(\(177\.2 -18\.9, 180 -18\.9, 180 -16\.4/);
+    assert.match(sql, /POLYGON\(\(-180 -18\.9, -178(\.0)? -18\.9/);
+  });
+
+  it("compacts a dateline split as one set, not one per half", async () => {
+    // A parent cell straddling ±180 has all its children in the union but in
+    // only one half, so compacting each half separately leaves the siblings
+    // unfolded. The two selects must reach h3_compact_cells together.
+    const { ctx, duckdb } = baseCtx([fijiLayer()], {
+      dggsType: "h3",
+      source: "extent",
+      layer: "fiji",
+      resolution: 4,
+      compactCells: true,
+    });
+    await createDggsGridTool.run(ctx);
+    assert.equal(duckdb.queries.length, 1);
+    const sql = duckdb.queries[0]!;
+    assert.match(sql, /SELECT DISTINCT cell FROM \(/);
+    assert.match(sql, /UNION ALL/);
+    assert.match(sql, /h3_compact_cells/);
   });
 
   it("keeps a globally spanning layer at full longitude", async () => {
@@ -502,33 +522,26 @@ describe("dggs generator", () => {
     assert.match(duckdb.queries[0], /POLYGON\(\(0 -10, 180 -10, 180 10, 0 10/);
   });
 
-  it("drops a cell that both halves of a dateline split return", async () => {
-    const logs: string[] = [];
-    const results: number[] = [];
-    let call = 0;
-    const ctx: ProcessingContext = {
-      layers: [fijiLayer()],
-      parameters: { dggsType: "h3", source: "extent", layer: "fiji", resolution: 4 },
-      log: (m) => logs.push(m),
-      addResultLayer: (_name, fc) => results.push(fc.features.length),
-      duckdb: {
-        ensureExtensions: async () => {},
-        registerGeoJson: async () => ({ sql: "mock", release: async () => {} }),
-        query: async () => {
-          call += 1;
-          const ids = call === 1 ? ["a", "b"] : ["b", "c"];
-          return ids.map((h3) => ({
-            h3,
-            geojson: '{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}',
-            count: 1,
-          }));
-        },
-      },
-      viewportBounds: () => [0, 0, 1, 1],
-    };
+  it("returns each cell once for a dateline split", async () => {
+    // A cell straddling ±180 belongs to both halves. The DuckDB path now gets
+    // its dedupe from `SELECT DISTINCT` over the union; the S2 path merges the
+    // two halves itself, so check that one here.
+    const results: GeoLibreLayer["geojson"][] = [];
+    const { ctx } = baseCtx([fijiLayer()], {
+      dggsType: "s2",
+      source: "extent",
+      layer: "fiji",
+      resolution: 6,
+    });
+    ctx.duckdb = undefined;
+    ctx.addResultLayer = (_name, fc) => results.push(fc);
     await createDggsGridTool.run(ctx);
-    // "b" straddles ±180 and is produced by both halves; it must appear once.
-    assert.deepEqual(results, [3]);
+    assert.equal(results.length, 1);
+    const ids = results[0]!.features.map((f) =>
+      String((f.properties as Record<string, unknown>).s2),
+    );
+    assert.ok(ids.length > 0);
+    assert.equal(new Set(ids).size, ids.length);
   });
 
   it("suggests the same bin resolution for a dateline layer as an equivalent one", async () => {
