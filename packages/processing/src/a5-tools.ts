@@ -116,6 +116,7 @@ export function buildA5GridFromBboxesSql(
       // Full globe in longitude. Filter by cell centroid latitude when the
       // view is not essentially ±90 (e.g. Web Mercator max ~±85).
       const fullLat = s <= -89.999 && n >= 89.999;
+      // Every cell, so any other box's cells are already in it.
       if (fullLat) {
         return finalizeA5Cells(`SELECT ${cellsFromRes0Expr(res)} AS cell`, compact);
       }
@@ -127,9 +128,8 @@ export function buildA5GridFromBboxesSql(
     }
     const lonSpan = e - w;
     if (lonSpan <= A5_MAX_POLYFILL_LON_SPAN) {
-      selects.push(
-        cellsFromGeomExpr(`ST_GeomFromText(${sqlStr(bboxToWktPolygon([w, s, e, n]))})`, res),
-      );
+      const wkt = bboxToWktPolygon([w, s, e, n]);
+      selects.push(`SELECT ${cellsFromGeomExpr(`ST_GeomFromText(${sqlStr(wkt)})`, res)} AS cell`);
       continue;
     }
     const parts = Math.ceil(lonSpan / A5_MAX_POLYFILL_LON_SPAN);
