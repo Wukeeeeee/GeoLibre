@@ -536,9 +536,14 @@ export const createDggsGridTool: ProcessingAlgorithm = {
         if (areaBboxes) {
           // Cover each part uncompacted, then compact the union once, so a
           // parent whose children straddle ±180 can still fold back together.
+          // Each part's own cap is its own budget, so the merged total is what
+          // has to hold the line.
           fc = mergeParts(
             areaBboxes.map((box) => s2GridFromBbox(box, res, { ...gridOpts, compact: false })),
           );
+          if (fc.features.length > hardCap) {
+            throw new RangeError(`S2 cell limit exceeded: ${hardCap}`);
+          }
           if (compactCells) fc = compactS2FeatureCollection(fc, { unwrap: fixAntimeridian });
         } else {
           fc = s2GridFromFeatureCollection(inputGeojson!, res, gridOpts);
@@ -579,6 +584,9 @@ export const createDggsGridTool: ProcessingAlgorithm = {
               dggalGridFromBbox(engine, box, res, hardCap, { compact: false }),
             ),
           );
+          if (merged.features.length > hardCap) {
+            throw new RangeError(`DGGAL zone limit exceeded: ${hardCap}`);
+          }
           return compactCells ? compactDggalFeatureCollection(engine, merged) : merged;
         });
         if (fc.features.length === 0) {
