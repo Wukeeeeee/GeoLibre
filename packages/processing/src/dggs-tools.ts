@@ -1,6 +1,7 @@
-import type { FeatureCollection } from "geojson";
+import type { Feature, FeatureCollection } from "geojson";
 import bbox from "@turf/bbox";
 import { type GeoLibreLayer, horizontalBbox } from "@geolibre/core";
+import { datelineBboxParts } from "./antimeridian";
 import type {
   DuckDbCapability,
   DuckDbGeoJsonSource,
@@ -158,6 +159,61 @@ function bboxFromParams(ctx: ProcessingContext): [number, number, number, number
     return null;
   }
   return [west, south, east, north];
+}
+
+/** The cell id a feature carries, so per-part results can be deduped. */
+function cellKey(feature: Feature): string | undefined {
+  const properties = feature.properties as Record<string, unknown> | null;
+  const value =
+    properties?.h3 ?? properties?.s2 ?? properties?.a5 ?? properties?.dggrid ?? properties?.dggal;
+  if (value != null) return String(value);
+  return feature.id != null ? String(feature.id) : undefined;
+}
+
+/**
+ * Concatenate the results of a dateline-split area. A cell that straddles ±180
+ * belongs to both halves and comes back twice, so drop the repeat by cell id —
+ * the single-query whole-world path gets that for free from SQL `DISTINCT`.
+ */
+function mergeParts(collections: FeatureCollection[]): FeatureCollection {
+  const seen = new Set<string>();
+  const features: Feature[] = [];
+  for (const collection of collections) {
+    for (const feature of collection.features) {
+      const key = cellKey(feature);
+      if (key !== undefined) {
+        if (seen.has(key)) continue;
+        seen.add(key);
+      }
+      features.push(feature);
+    }
+  }
+  return { type: "FeatureCollection", features };
+}
+
+/** Dedupe rows across dateline-split halves, matching a per-query `SELECT DISTINCT`. */
+function mergeRows(rows: Record<string, unknown>[], column: string): Record<string, unknown>[] {
+  const seen = new Set<string>();
+  const merged: Record<string, unknown>[] = [];
+  for (const row of rows) {
+    const key = String(row[column]);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(row);
+  }
+  return merged;
+}
+
+/** Total area of a dateline-split area, so resolution suggestions match it. */
+function partsAreaKm2(parts: [number, number, number, number][]): number {
+  return parts.reduce((total, part) => total + bboxAreaKm2(part), 0);
+}
+
+/** Normalized parts, ready for a backend that wants plain in-range boxes. */
+function normalizeParts(
+  parts: [number, number, number, number][],
+): [number, number, number, number][] {
+  return parts.map(normalizeLonLatBbox);
 }
 
 function resolveDggsType(ctx: ProcessingContext): DggsType | null {
@@ -398,7 +454,7 @@ export const createDggsGridTool: ProcessingAlgorithm = {
     const source = (ctx.parameters.source as string) || "polyfill";
 
     let areaKm2: number;
-    let areaBbox: [number, number, number, number] | null = null;
+    let areaBboxes: [number, number, number, number][] | null = null;
     let inputGeojson: FeatureCollection | null = null;
     if (source === "viewport") {
       const bounds = ctx.viewportBounds?.();
@@ -412,13 +468,13 @@ export const createDggsGridTool: ProcessingAlgorithm = {
         );
         return;
       }
-      areaBbox = normalizeLonLatBbox(bounds);
-      areaKm2 = bboxAreaKm2(areaBbox);
+      areaBboxes = [normalizeLonLatBbox(bounds)];
+      areaKm2 = partsAreaKm2(areaBboxes);
     } else if (source === "bbox") {
       const bounds = bboxFromParams(ctx);
       if (!bounds) return;
-      areaBbox = normalizeLonLatBbox(bounds);
-      areaKm2 = bboxAreaKm2(areaBbox);
+      areaBboxes = [normalizeLonLatBbox(bounds)];
+      areaKm2 = partsAreaKm2(areaBboxes);
     } else {
       const layer = getLayer(ctx, "layer");
       if (!layer?.geojson?.features?.length) {
@@ -442,13 +498,22 @@ export const createDggsGridTool: ProcessingAlgorithm = {
         ctx.log('Error: parameter "layer" has no usable extent');
         return;
       }
-      const bb = normalizeLonLatBbox(layerBox);
-      areaKm2 = bboxAreaKm2(bb);
-      if (source === "extent") areaBbox = bb;
+      // A layer straddling the dateline reads as a >180° bbox, so measure it as
+      // the narrow window it really is (split into in-range parts) instead of
+      // handing every backend a whole-longitude box.
+      const parts = normalizeParts(datelineBboxParts(layer.geojson, layerBox));
+      areaKm2 = partsAreaKm2(parts);
+      if (source === "extent") areaBboxes = parts;
       // A5 `geometry_to_cells` returns [] for a ±180° world ring; use the bbox
       // path (res0 enumeration) when the layer extent is full longitude.
-      if (source === "polyfill" && type === "a5" && bb[0] === -180 && bb[2] === 180) {
-        areaBbox = bb;
+      if (
+        source === "polyfill" &&
+        type === "a5" &&
+        parts.length === 1 &&
+        parts[0][0] === -180 &&
+        parts[0][2] === 180
+      ) {
+        areaBboxes = parts;
       }
     }
 
@@ -481,8 +546,8 @@ export const createDggsGridTool: ProcessingAlgorithm = {
           compact: compactCells,
         };
         const fc =
-          areaBbox != null
-            ? s2GridFromBbox(areaBbox, res, gridOpts)
+          areaBboxes != null
+            ? mergeParts(areaBboxes.map((box) => s2GridFromBbox(box, res, gridOpts)))
             : s2GridFromFeatureCollection(inputGeojson!, res, gridOpts);
         if (fc.features.length === 0) {
           ctx.log(
@@ -509,8 +574,12 @@ export const createDggsGridTool: ProcessingAlgorithm = {
     if (type === "dggal") {
       try {
         const fc = await withDggalDggrs(dggalType, (engine) =>
-          areaBbox != null
-            ? dggalGridFromBbox(engine, areaBbox, res, hardCap, { compact: compactCells })
+          areaBboxes != null
+            ? mergeParts(
+                areaBboxes.map((box) =>
+                  dggalGridFromBbox(engine, box, res, hardCap, { compact: compactCells }),
+                ),
+              )
             : dggalGridFromFeatureCollection(engine, inputGeojson!, res, hardCap, {
                 compact: compactCells,
               }),
@@ -541,24 +610,32 @@ export const createDggsGridTool: ProcessingAlgorithm = {
     let registered: DuckDbGeoJsonSource | null = null;
     try {
       await duckdb.ensureExtensions(["spatial", extension!]);
-      let sql: string;
-      if (areaBbox) {
-        sql =
-          type === "a5"
-            ? buildA5GridFromBboxSql(areaBbox, res, compactCells)
-            : type === "dggrid"
-              ? buildDggridGridFromWktSql(bboxToWktPolygon(areaBbox), res, dggridType)
-              : buildGridFromBboxSql(areaBbox, res, compactCells);
+      let rows: Record<string, unknown>[];
+      if (areaBboxes) {
+        // One query per part; a dateline-split area needs its halves unioned
+        // here because each `SELECT DISTINCT` only sees its own box.
+        const column = type === "a5" ? "a5" : type === "dggrid" ? "dggrid" : "h3";
+        const collected: Record<string, unknown>[] = [];
+        for (const box of areaBboxes) {
+          const sql =
+            type === "a5"
+              ? buildA5GridFromBboxSql(box, res, compactCells)
+              : type === "dggrid"
+                ? buildDggridGridFromWktSql(bboxToWktPolygon(box), res, dggridType)
+                : buildGridFromBboxSql(box, res, compactCells);
+          collected.push(...(await duckdb.query(sql)));
+        }
+        rows = mergeRows(collected, column);
       } else {
         registered = await duckdb.registerGeoJson(inputGeojson!);
-        sql =
+        const sql =
           type === "a5"
             ? buildA5GridFromSourceSql(registered.sql, res, compactCells)
             : type === "dggrid"
               ? buildDggridGridFromSourceSql(registered.sql, res, dggridType)
               : buildGridFromSourceSql(registered.sql, res, compactCells);
+        rows = await duckdb.query(sql);
       }
-      const rows = await duckdb.query(sql);
       const fc =
         type === "a5"
           ? a5RowsToFeatureCollection(rows)
@@ -666,9 +743,12 @@ export const dggsBinPointsTool: ProcessingAlgorithm = {
       ctx.log('Error: parameter "layer" has no usable extent');
       return;
     }
+    // Measure the same way the generator does, so a dateline-straddling layer
+    // is not told to bin at the resolution its inflated bbox implies.
+    const areaKm2 = partsAreaKm2(normalizeParts(datelineBboxParts(layer.geojson, bb)));
     const dggridType = resolveDggridGridType(ctx.parameters.dggridType);
     const dggalType = resolveDggalGridType(ctx.parameters.dggalType);
-    const res = resolveResolution(ctx, type, bboxAreaKm2(bb), dggridType, dggalType);
+    const res = resolveResolution(ctx, type, areaKm2, dggridType, dggalType);
     if (res === null) return;
 
     const fixAntimeridian = resolveFixAntimeridian(ctx, type);
